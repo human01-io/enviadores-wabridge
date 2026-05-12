@@ -263,10 +263,14 @@ func (b *Bridge) resolveDisplayName(ctx context.Context, evt *events.Message) sq
 			}
 		}
 	}
-	// Fall back to the PushName on the live message envelope. For groups,
-	// the chat's subject would need GetGroupInfo — left for a later pass.
-	if name := strings.TrimSpace(evt.Info.PushName); name != "" {
-		return nullString(name)
+	// Fall back to the PushName on the message envelope — but ONLY for
+	// inbound messages. On outbound (from_me) messages PushName is the
+	// sender (us), not the recipient, so it would mislabel the chat with
+	// our own name.
+	if !evt.Info.IsFromMe {
+		if name := strings.TrimSpace(evt.Info.PushName); name != "" {
+			return nullString(name)
+		}
 	}
 	return sql.NullString{}
 }
