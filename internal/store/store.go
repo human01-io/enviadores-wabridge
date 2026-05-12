@@ -135,6 +135,31 @@ func (s *Store) InsertMessage(ctx context.Context, m Message) error {
 	return err
 }
 
+// RecomputeChatTail refreshes last_message_at / preview / from_me on a chat
+// from whatever is currently in wa_messages. Used after backfilling history
+// in bulk so the chat list reflects the most recent timestamp without each
+// insert paying the cost of an UpsertChat.
+func (s *Store) RecomputeChatTail(ctx context.Context, chatJID string) error {
+	const q = `
+		UPDATE wa_chats c
+		LEFT JOIN (
+			SELECT chat_jid,
+			       MAX(timestamp) AS max_ts
+			FROM wa_messages
+			WHERE chat_jid = ?
+			GROUP BY chat_jid
+		) agg ON agg.chat_jid = c.jid
+		LEFT JOIN wa_messages tail
+		       ON tail.chat_jid = c.jid AND tail.timestamp = agg.max_ts
+		SET c.last_message_at      = agg.max_ts,
+		    c.last_message_preview = LEFT(COALESCE(tail.body, ''), 160),
+		    c.last_message_from_me = COALESCE(tail.from_me, 0)
+		WHERE c.jid = ?
+	`
+	_, err := s.db.ExecContext(ctx, q, chatJID, chatJID)
+	return err
+}
+
 func boolInt(b bool) int {
 	if b {
 		return 1

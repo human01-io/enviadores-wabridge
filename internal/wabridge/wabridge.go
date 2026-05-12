@@ -160,7 +160,144 @@ func (b *Bridge) handleEvent(evt interface{}) {
 		b.logger.Errorf("Logged out: %s — re-pair required", v.Reason)
 	case *events.Message:
 		b.handleMessage(v)
+	case *events.HistorySync:
+		// History sync can carry thousands of messages; offload to a
+		// goroutine so we don't block subsequent live events.
+		go b.handleHistorySync(v)
 	}
+}
+
+// handleHistorySync walks the conversations + messages whatsmeow delivers
+// after pair (and periodically during normal operation) and writes them
+// into wa_chats / wa_messages. Media is NOT re-downloaded here — the URLs
+// in history-sync envelopes are usually expired; we just persist metadata
+// (mime, filename) so the UI shows "documento" etc. instead of nothing.
+func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	data := evt.Data
+	convs := data.GetConversations()
+	b.logger.Infof("History sync: type=%s progress=%d%% conversations=%d",
+		data.GetSyncType().String(), data.GetProgress(), len(convs))
+
+	totalInserted := 0
+	for _, conv := range convs {
+		select {
+		case <-ctx.Done():
+			b.logger.Warnf("History sync cancelled: %v", ctx.Err())
+			return
+		default:
+		}
+
+		chatJIDStr := conv.GetID()
+		chatJID, err := types.ParseJID(chatJIDStr)
+		if err != nil {
+			b.logger.Warnf("History sync: bad JID %s: %v", chatJIDStr, err)
+			continue
+		}
+		isGroup := chatJID.Server == types.GroupServer
+
+		displayName := b.resolveDisplayNameForJID(ctx, chatJID, conv.GetName())
+		phoneE164 := sql.NullString{}
+		if chatJID.Server == types.DefaultUserServer && chatJID.User != "" {
+			phoneE164 = nullString("+" + chatJID.User)
+		}
+
+		// Initial upsert with no last_message_* — we'll fill those after
+		// inserting the conversation's messages.
+		chatRow := store.Chat{
+			JID:             chatJIDStr,
+			DisplayName:     displayName,
+			PhoneE164:       phoneE164,
+			IsGroup:         isGroup,
+			ProfilePicURL:   sql.NullString{},
+			IncrementUnread: false, // history backfill does not bump unread
+		}
+		if err := b.store.UpsertChat(ctx, chatRow); err != nil {
+			b.logger.Warnf("History sync UpsertChat %s: %v", chatJIDStr, err)
+			continue
+		}
+
+		inserted := 0
+		for _, histMsg := range conv.GetMessages() {
+			webMsg := histMsg.GetMessage()
+			if webMsg == nil {
+				continue
+			}
+			parsed, err := b.client.ParseWebMessage(chatJID, webMsg)
+			if err != nil {
+				continue
+			}
+
+			msgType, body, mediaInfo := classifyMessage(parsed.Message)
+
+			var mediaName, mediaMime sql.NullString
+			if mediaInfo != nil {
+				mediaName = nullString(mediaInfo.filename)
+				mediaMime = nullString(mediaInfo.mime)
+			}
+
+			senderJID := sql.NullString{}
+			if s := parsed.Info.Sender.String(); s != "" {
+				senderJID = nullString(s)
+			}
+
+			m := store.Message{
+				ID:            parsed.Info.ID,
+				ChatJID:       chatJIDStr,
+				SenderJID:     senderJID,
+				FromMe:        parsed.Info.IsFromMe,
+				MessageType:   msgType,
+				Body:          nullString(body),
+				MediaMime:     mediaMime,
+				MediaFilename: mediaName,
+				Timestamp:     parsed.Info.Timestamp,
+				Status:        sql.NullString{String: defaultStatus(parsed.Info.IsFromMe), Valid: true},
+			}
+			if err := b.store.InsertMessage(ctx, m); err != nil {
+				// transient row error — keep going on the next message
+				continue
+			}
+			inserted++
+		}
+
+		if inserted > 0 {
+			if err := b.store.RecomputeChatTail(ctx, chatJIDStr); err != nil {
+				b.logger.Warnf("RecomputeChatTail %s: %v", chatJIDStr, err)
+			}
+		}
+		totalInserted += inserted
+	}
+
+	b.logger.Infof("History sync: inserted %d messages across %d conversations",
+		totalInserted, len(convs))
+}
+
+// resolveDisplayNameForJID is the equivalent of resolveDisplayName but for
+// the history-sync path, where we have a JID + a hint name from the
+// conversation envelope instead of an *events.Message.
+func (b *Bridge) resolveDisplayNameForJID(ctx context.Context, jid types.JID, convName string) sql.NullString {
+	if name := strings.TrimSpace(convName); name != "" {
+		return nullString(name)
+	}
+	if jid.Server != types.GroupServer {
+		if c, err := b.client.Store.Contacts.GetContact(ctx, jid); err == nil && c.Found {
+			if name := strings.TrimSpace(c.FullName); name != "" {
+				return nullString(name)
+			}
+			if name := strings.TrimSpace(c.FirstName); name != "" {
+				return nullString(name)
+			}
+			if name := strings.TrimSpace(c.BusinessName); name != "" {
+				return nullString(name)
+			}
+			if name := strings.TrimSpace(c.PushName); name != "" {
+				return nullString(name)
+			}
+		}
+	}
+	return sql.NullString{}
 }
 
 func (b *Bridge) handleMessage(evt *events.Message) {
