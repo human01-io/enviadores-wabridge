@@ -1,0 +1,10 @@
+.DS_Store
+config.yaml
+whatsmeow.db
+whatsmeow.db-journal
+whatsmeow.db-shm
+whatsmeow.db-wal
+*.log
+*.exe
+/wabridge
+/dist

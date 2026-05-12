@@ -1,0 +1,44 @@
+# enviadores-wabridge configuration
+#
+# Copy to config.yaml in the same directory as the binary and fill in.
+# Never commit the real config.yaml — see .gitignore.
+
+ssh:
+  # SSH endpoint of the shared host (same as your `enviadores` alias)
+  host: enviadores.com.mx
+  port: 22
+  user: cxcc76i48ff4
+  # Path to a private key with passwordless access (id_ed25519, etc.).
+  # On Windows this is typically: C:\Users\<you>\.ssh\id_ed25519
+  private_key_path: C:\Users\Operador\.ssh\id_ed25519
+  # Optional. If set, used to decrypt the key.
+  private_key_passphrase: ""
+  # Known-hosts file path. If empty, host key is accepted on first connect.
+  # On Windows: C:\Users\<you>\.ssh\known_hosts
+  known_hosts_path: ""
+
+# MySQL connection — accessed via the SSH tunnel as localhost:remote_port → enviadores:3306.
+mysql:
+  user: wabridge
+  password: "REDACTED"
+  database: env_producto
+  # Local port that wabridge binds for the SSH tunnel; pick something free.
+  local_tunnel_port: 53306
+
+# Where wabridge SFTPs incoming WhatsApp media on the shared host. The PHP
+# gateway exposes it as https://enviadores.com.mx/wa_media/<sha256>.<ext>.
+media:
+  remote_path: /home/cxcc76i48ff4/public_html/wa_media
+  public_base_url: https://enviadores.com.mx/wa_media
+
+# whatsmeow device session — local SQLite. Path is relative to working dir.
+whatsmeow:
+  store_path: whatsmeow.db
+  # Verbose protocol logs only matter while debugging pairing.
+  log_level: INFO
+
+# How wabridge identifies itself in logs.
+service:
+  name: enviadores-wabridge
+  display_name: Enviadores WhatsApp Bridge
+  description: Mirrors WhatsApp messages for PDV0000001 into env_producto
