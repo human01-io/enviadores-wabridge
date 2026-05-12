@@ -433,7 +433,32 @@ func (b *Bridge) fetchProfilePicURL(ctx context.Context, jid types.JID) sql.Null
 }
 
 // classifyMessage returns (type, text body, optional media descriptor).
+// Recursively unwraps the container proto types whatsmeow surfaces:
+//   - DeviceSentMessage: messages sent from another linked device (e.g.
+//     when you send from your phone, your linked clients receive it
+//     wrapped in this).
+//   - EphemeralMessage: disappearing messages.
+//   - ViewOnceMessage / ViewOnceMessageV2: "view once" media.
+//   - DocumentWithCaptionMessage: documents that carry a caption.
+// Without unwrapping, the outer envelope has none of the leaf accessors
+// set and we'd misclassify the whole thing as "other".
 func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
+	if dsm := msg.GetDeviceSentMessage(); dsm != nil && dsm.GetMessage() != nil {
+		return classifyMessage(dsm.GetMessage())
+	}
+	if eph := msg.GetEphemeralMessage(); eph != nil && eph.GetMessage() != nil {
+		return classifyMessage(eph.GetMessage())
+	}
+	if vom := msg.GetViewOnceMessage(); vom != nil && vom.GetMessage() != nil {
+		return classifyMessage(vom.GetMessage())
+	}
+	if vom := msg.GetViewOnceMessageV2(); vom != nil && vom.GetMessage() != nil {
+		return classifyMessage(vom.GetMessage())
+	}
+	if dwc := msg.GetDocumentWithCaptionMessage(); dwc != nil && dwc.GetMessage() != nil {
+		return classifyMessage(dwc.GetMessage())
+	}
+
 	switch {
 	case msg.GetConversation() != "":
 		return "text", msg.GetConversation(), nil
