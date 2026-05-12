@@ -536,7 +536,10 @@ func nullString(s string) sql.NullString {
 // on the next listMessages poll without waiting for an event echo (which
 // whatsmeow doesn't always deliver back to the originating device).
 func (b *Bridge) WatchOutbound(ctx context.Context) error {
-	ticker := time.NewTicker(2 * time.Second)
+	// 500ms keeps perceived send latency close to network RTT without
+	// hammering MySQL — even at one outbox check per 500ms across a quiet
+	// queue, this is ~120 cheap indexed reads per minute.
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -617,15 +620,20 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	}
 
 	// Insert into wa_messages so the UI sees the message right away.
+	// Carry the client_request_id forward so the React inbox can match
+	// its optimistic bubble against this real row deterministically,
+	// regardless of whether send.php has already responded with the
+	// whatsapp_message_id (the two race).
 	msgRow := store.Message{
-		ID:          resp.ID,
-		ChatJID:     r.ChatJID,
-		SenderJID:   nullString(b.selfJID()),
-		FromMe:      true,
-		MessageType: "text",
-		Body:        nullString(r.Body),
-		Timestamp:   resp.Timestamp,
-		Status:      sql.NullString{String: "sent", Valid: true},
+		ID:              resp.ID,
+		ChatJID:         r.ChatJID,
+		SenderJID:       nullString(b.selfJID()),
+		FromMe:          true,
+		MessageType:     "text",
+		Body:            nullString(r.Body),
+		ClientRequestID: nullString(r.ClientRequestID),
+		Timestamp:       resp.Timestamp,
+		Status:          sql.NullString{String: "sent", Valid: true},
 	}
 	if err := b.store.InsertMessage(ctx, msgRow); err != nil {
 		b.logger.Warnf("Insert outbound wa_messages %s: %v", resp.ID, err)
