@@ -493,9 +493,62 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 	case msg.GetProtocolMessage() != nil &&
 		msg.GetProtocolMessage().GetType() == waProto.ProtocolMessage_REVOKE:
 		return "revoked", "", nil
+
+	// Rich / interactive types that aren't strictly media — keep
+	// message_type='other' but populate body with an informative label so
+	// the bubble + chat-list preview both render something useful.
+	case msg.GetPollCreationMessage() != nil:
+		return "other", pollPreview(msg.GetPollCreationMessage().GetName(), pollOptionNames(msg.GetPollCreationMessage().GetOptions())), nil
+	case msg.GetPollCreationMessageV2() != nil:
+		return "other", pollPreview(msg.GetPollCreationMessageV2().GetName(), pollOptionNames(msg.GetPollCreationMessageV2().GetOptions())), nil
+	case msg.GetPollUpdateMessage() != nil:
+		return "other", "🗳️ Voto en encuesta", nil
+	case msg.GetButtonsMessage() != nil:
+		content := strings.TrimSpace(msg.GetButtonsMessage().GetContentText())
+		if content == "" {
+			content = "Mensaje con botones"
+		}
+		return "other", "🔘 " + content, nil
+	case msg.GetButtonsResponseMessage() != nil:
+		return "other", "▶ " + msg.GetButtonsResponseMessage().GetSelectedDisplayText(), nil
+	case msg.GetListMessage() != nil:
+		title := strings.TrimSpace(msg.GetListMessage().GetTitle())
+		if title == "" {
+			title = strings.TrimSpace(msg.GetListMessage().GetDescription())
+		}
+		if title == "" {
+			title = "Lista interactiva"
+		}
+		return "other", "📋 " + title, nil
+	case msg.GetListResponseMessage() != nil:
+		return "other", "▶ " + msg.GetListResponseMessage().GetTitle(), nil
+	case msg.GetTemplateMessage() != nil:
+		return "other", "📋 Plantilla", nil
+
 	default:
 		return "other", "", nil
 	}
+}
+
+func pollOptionNames(opts []*waProto.PollCreationMessage_Option) []string {
+	out := make([]string, 0, len(opts))
+	for _, o := range opts {
+		if name := strings.TrimSpace(o.GetOptionName()); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func pollPreview(name string, options []string) string {
+	parts := []string{"📊 Encuesta"}
+	if n := strings.TrimSpace(name); n != "" {
+		parts[0] = "📊 " + n
+	}
+	for _, o := range options {
+		parts = append(parts, "• "+o)
+	}
+	return strings.Join(parts, "\n")
 }
 
 type mediaDescriptor struct {
