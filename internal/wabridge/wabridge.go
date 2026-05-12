@@ -23,6 +23,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 type Bridge struct {
@@ -501,8 +502,17 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 		return "other", pollPreview(msg.GetPollCreationMessage().GetName(), pollOptionNames(msg.GetPollCreationMessage().GetOptions())), nil
 	case msg.GetPollCreationMessageV2() != nil:
 		return "other", pollPreview(msg.GetPollCreationMessageV2().GetName(), pollOptionNames(msg.GetPollCreationMessageV2().GetOptions())), nil
+	case msg.GetPollCreationMessageV3() != nil:
+		return "other", pollPreview(msg.GetPollCreationMessageV3().GetName(), pollOptionNames(msg.GetPollCreationMessageV3().GetOptions())), nil
 	case msg.GetPollUpdateMessage() != nil:
 		return "other", "🗳️ Voto en encuesta", nil
+
+	// Encryption-protocol envelopes — silently classified as 'system' so
+	// the UI hides them (bodylessPlaceholder returns null for system).
+	// Not user-facing content, just a side effect of group / sender-key
+	// setup that whatsmeow surfaces alongside real messages.
+	case msg.GetSenderKeyDistributionMessage() != nil:
+		return "system", "", nil
 	case msg.GetButtonsMessage() != nil:
 		content := strings.TrimSpace(msg.GetButtonsMessage().GetContentText())
 		if content == "" {
@@ -526,8 +536,38 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 		return "other", "📋 Plantilla", nil
 
 	default:
+		// Diagnostic: list the proto field names actually populated on
+		// this Message so we can extend the classifier next time. The
+		// body is shown in the bubble + chat preview so any uncovered
+		// type becomes visible at a glance instead of a generic
+		// "Mensaje no compatible".
+		fields := setProtoFields(msg)
+		if len(fields) > 0 {
+			return "other", "[proto: " + strings.Join(fields, ", ") + "]", nil
+		}
 		return "other", "", nil
 	}
+}
+
+// setProtoFields returns the names of fields populated on a proto Message
+// using reflection. Filters out a couple of envelope fields that show up
+// on nearly every message and aren't useful for diagnostics.
+func setProtoFields(msg *waProto.Message) []string {
+	if msg == nil {
+		return nil
+	}
+	skip := map[string]bool{
+		"messageContextInfo": true,
+	}
+	var out []string
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		name := string(fd.Name())
+		if !skip[name] {
+			out = append(out, name)
+		}
+		return true
+	})
+	return out
 }
 
 func pollOptionNames(opts []*waProto.PollCreationMessage_Option) []string {
