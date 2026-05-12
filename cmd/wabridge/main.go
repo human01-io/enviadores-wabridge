@@ -161,7 +161,7 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 
 	up := media.New(cfg, tun.SFTP())
 
-	bridge, err := wabridge.New(cfg, st, up)
+	bridge, err := wabridge.New(ctx, cfg, st, up)
 	if err != nil {
 		return fmt.Errorf("init whatsmeow: %w", err)
 	}
@@ -171,9 +171,12 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("start whatsmeow: %w", err)
 	}
 
-	// Block until either the SSH tunnel dies or we're cancelled.
+	// Block until any of: tunnel dies, web UI requests reset, or we're cancelled.
 	tunnelDone := make(chan error, 1)
 	go func() { tunnelDone <- tun.Wait() }()
+
+	resetDone := make(chan error, 1)
+	go func() { resetDone <- bridge.WatchResetRequests(ctx) }()
 
 	select {
 	case <-ctx.Done():
@@ -182,6 +185,8 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 		if err == nil {
 			err = fmt.Errorf("ssh tunnel closed")
 		}
+		return err
+	case err := <-resetDone:
 		return err
 	}
 }

@@ -48,8 +48,10 @@ on the active chat, so latency end-to-end is single-digit seconds.
 
 ## Setup
 
+### Windows (production target)
+
 ```cmd
-git clone https://github.com/<your-org>/enviadores-wabridge.git
+git clone https://github.com/human01-io/enviadores-wabridge.git
 cd enviadores-wabridge
 go mod tidy
 copy config.example.yaml config.yaml
@@ -57,40 +59,74 @@ notepad config.yaml   :: fill in SSH user, key path, MySQL password
 go build -o wabridge.exe ./cmd/wabridge
 ```
 
+### macOS / Linux (same recipe, same binary semantics)
+
+```bash
+git clone https://github.com/human01-io/enviadores-wabridge.git
+cd enviadores-wabridge
+go mod tidy
+cp config.example.yaml config.yaml
+$EDITOR config.yaml   # ~ in paths is expanded to your home dir
+go build -o wabridge ./cmd/wabridge
+```
+
+The same `config.yaml` works on every platform — `~/.ssh/id_ed25519` is
+expanded per-OS. All platform-specific service plumbing (launchd, systemd,
+Windows SCM) is handled by `kardianos/service` behind `wabridge install`.
+
 ## First run (QR pairing)
 
 ```cmd
-wabridge.exe run
+wabridge.exe run        :: or `./wabridge run` on macOS/Linux
 ```
 
-A QR code prints to stdout. Open WhatsApp on the phone holding the business
-number → ⋮ → **Linked devices** → **Link a device** → scan. The bridge picks
-up the session in `whatsmeow.db` and starts mirroring on the next message.
+The bridge writes its QR codes to the `wa_pairing` MySQL row, where the
+web app reads them. Open **https://app.enviadores.com.mx/whatsapp** as an
+admin with active PDV `PDV0000001` — the page renders the QR. Scan it with
+**WhatsApp → ⋮ → Linked devices → Link a device** on the phone holding the
+business number. The card flips to the chat list as soon as whatsmeow
+fires `PairSuccess`.
+
+The same QR string also prints to stdout as a terminal fallback (one-line
+encoded string, not a rendered code).
 
 `Ctrl+C` to stop.
 
-## Install as a Windows service (run on boot)
+## Install as a service (Windows / macOS / Linux)
 
-After the QR pairing has been done once and `whatsmeow.db` exists, install
-the service:
+After pairing has been done once and `whatsmeow.db` exists, install the
+service. `kardianos/service` picks the right backend per OS:
 
+| OS      | Backend                | Auto-starts on |
+|---------|------------------------|----------------|
+| Windows | Service Control Manager | Boot          |
+| macOS   | launchd (LaunchDaemon)  | Boot          |
+| Linux   | systemd                 | Boot          |
+
+```bash
+sudo ./wabridge install     # macOS/Linux
+sudo ./wabridge start
+```
 ```cmd
-wabridge.exe install
+wabridge.exe install        :: Windows (run elevated cmd)
 wabridge.exe start
 ```
 
 Service control:
 
-```cmd
-wabridge.exe stop
-wabridge.exe start
-wabridge.exe uninstall
+```bash
+./wabridge stop
+./wabridge start
+./wabridge uninstall
 ```
 
-Service logs land in the Windows Event Log under
-`Enviadores WhatsApp Bridge`. For more verbose output, set
-`whatsmeow.log_level: DEBUG` in `config.yaml` and run `wabridge.exe run`
-in the foreground.
+Logs:
+- Windows: Event Log under `Enviadores WhatsApp Bridge`
+- macOS:   `/var/log/system.log`, and stderr in `/Library/LaunchDaemons` plist
+- Linux:   `journalctl -u enviadores-wabridge`
+
+For verbose output, set `whatsmeow.log_level: DEBUG` in `config.yaml` and
+run `wabridge run` in the foreground.
 
 ## Layout
 

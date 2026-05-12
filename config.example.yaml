@@ -8,13 +8,15 @@ ssh:
   host: enviadores.com.mx
   port: 22
   user: cxcc76i48ff4
-  # Path to a private key with passwordless access (id_ed25519, etc.).
-  # On Windows this is typically: C:\Users\<you>\.ssh\id_ed25519
-  private_key_path: C:\Users\Operador\.ssh\id_ed25519
+  # Path to a private key with passwordless access. "~" is expanded to the
+  # current user's home directory on macOS, Linux, and Windows.
+  #   macOS / Linux: ~/.ssh/id_ed25519
+  #   Windows      : ~/.ssh/id_ed25519        (or C:\Users\Operador\.ssh\id_ed25519)
+  private_key_path: ~/.ssh/id_ed25519
   # Optional. If set, used to decrypt the key.
   private_key_passphrase: ""
   # Known-hosts file path. If empty, host key is accepted on first connect.
-  # On Windows: C:\Users\<you>\.ssh\known_hosts
+  # ~/.ssh/known_hosts works everywhere.
   known_hosts_path: ""
 
 # MySQL connection — accessed via the SSH tunnel as localhost:remote_port → enviadores:3306.

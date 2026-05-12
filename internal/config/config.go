@@ -3,9 +3,30 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ExpandHome turns a leading "~" into the current user's home directory.
+// Works on macOS, Linux, and Windows; no-op for absolute or bare paths.
+func ExpandHome(p string) string {
+	if p == "" || !strings.HasPrefix(p, "~") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		return filepath.Join(home, p[2:])
+	}
+	return p
+}
 
 type Config struct {
 	SSH       SSHConfig       `yaml:"ssh"`
@@ -68,5 +89,8 @@ func Load(path string) (*Config, error) {
 	if c.Whatsmeow.LogLevel == "" {
 		c.Whatsmeow.LogLevel = "INFO"
 	}
+	c.SSH.PrivateKeyPath = ExpandHome(c.SSH.PrivateKeyPath)
+	c.SSH.KnownHostsPath = ExpandHome(c.SSH.KnownHostsPath)
+	c.Whatsmeow.StorePath = ExpandHome(c.Whatsmeow.StorePath)
 	return &c, nil
 }

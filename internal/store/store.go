@@ -44,6 +44,11 @@ func Open(ctx context.Context, cfg *config.Config, tunnelAddr string) (*Store, e
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB returns the underlying connection. Use sparingly — most writes should
+// go through methods on Store. Currently used by internal/pairing for the
+// wa_pairing single-row state bus.
+func (s *Store) DB() *sql.DB { return s.db }
+
 type Chat struct {
 	JID                string
 	DisplayName        sql.NullString

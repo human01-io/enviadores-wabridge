@@ -12,6 +12,7 @@ import (
 
 	"github.com/enviadores/wabridge/internal/config"
 	"github.com/enviadores/wabridge/internal/media"
+	"github.com/enviadores/wabridge/internal/pairing"
 	"github.com/enviadores/wabridge/internal/store"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -26,17 +27,18 @@ import (
 type Bridge struct {
 	cfg      *config.Config
 	store    *store.Store
+	pairing  *pairing.Writer
 	uploader *media.Uploader
 	client   *whatsmeow.Client
 	logger   waLog.Logger
 }
 
-func New(cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, error) {
+func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, error) {
 	level := strings.ToUpper(cfg.Whatsmeow.LogLevel)
 	dbLog := waLog.Stdout("wa-db", level, true)
 	clientLog := waLog.Stdout("wa-client", level, true)
 
-	container, err := sqlstore.New("sqlite3",
+	container, err := sqlstore.New(ctx, "sqlite3",
 		fmt.Sprintf("file:%s?_foreign_keys=on", cfg.Whatsmeow.StorePath),
 		dbLog,
 	)
@@ -44,7 +46,7 @@ func New(cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, erro
 		return nil, fmt.Errorf("open whatsmeow sqlite store: %w", err)
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get device: %w", err)
 	}
@@ -54,6 +56,7 @@ func New(cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, erro
 	b := &Bridge{
 		cfg:      cfg,
 		store:    st,
+		pairing:  pairing.New(st.DB()),
 		uploader: up,
 		client:   client,
 		logger:   clientLog,
@@ -62,31 +65,83 @@ func New(cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, erro
 	return b, nil
 }
 
-// Start connects to WhatsApp. If no device session exists, it prints a QR
-// code to stdout for pairing on first run.
+// Start connects to WhatsApp. If no device session exists, it streams QR
+// codes to both stdout (terminal fallback) and the wa_pairing MySQL row so
+// the React app at /whatsapp can render them.
 func (b *Bridge) Start(ctx context.Context) error {
 	if b.client.Store.ID == nil {
 		qrChan, _ := b.client.GetQRChannel(ctx)
 		if err := b.client.Connect(); err != nil {
 			return err
 		}
-		go func() {
-			for evt := range qrChan {
-				switch evt.Event {
-				case "code":
-					b.logger.Infof("=== SCAN THIS QR CODE WITH WHATSAPP > LINKED DEVICES ===")
-					b.logger.Infof("%s", evt.Code)
-					b.logger.Infof("======================================================")
-				case "success":
-					b.logger.Infof("Paired successfully")
-				case "timeout":
-					b.logger.Warnf("QR pairing timed out — restart wabridge to retry")
-				}
-			}
-		}()
+		go b.runQRLoop(ctx, qrChan)
 		return nil
 	}
+	// Already paired — mark the bus accordingly so the UI doesn't show stale
+	// QR codes from a previous pairing attempt.
+	if err := b.pairing.SetPaired(ctx, b.client.Store.ID.String()); err != nil {
+		b.logger.Warnf("pairing.SetPaired: %v", err)
+	}
 	return b.client.Connect()
+}
+
+// runQRLoop forwards QR / status events from whatsmeow into wa_pairing and
+// the terminal until the channel closes (either by pairing success or
+// timeout).
+func (b *Bridge) runQRLoop(ctx context.Context, qrChan <-chan whatsmeow.QRChannelItem) {
+	for evt := range qrChan {
+		switch evt.Event {
+		case "code":
+			b.logger.Infof("QR code emitted (valid ~20s) — visible at app.enviadores.com.mx/whatsapp")
+			b.logger.Infof("Terminal fallback: %s", evt.Code)
+			if err := b.pairing.SetQRCode(ctx, evt.Code, 20*time.Second); err != nil {
+				b.logger.Warnf("pairing.SetQRCode: %v", err)
+			}
+		case "success":
+			b.logger.Infof("Paired successfully")
+			if b.client.Store.ID != nil {
+				if err := b.pairing.SetPaired(ctx, b.client.Store.ID.String()); err != nil {
+					b.logger.Warnf("pairing.SetPaired: %v", err)
+				}
+			}
+		case "timeout":
+			b.logger.Warnf("QR pairing timed out — restart wabridge or click 'Reset' in the web UI")
+			_ = b.pairing.SetEvent(ctx, pairing.StatusError, "qr timeout")
+		default:
+			_ = b.pairing.SetEvent(ctx, pairing.StatusError, "qr event: "+evt.Event)
+		}
+	}
+}
+
+// WatchResetRequests polls wa_pairing for a non-NULL reset_requested_at
+// every few seconds. When the web app sets that field, the bridge logs out
+// the current WhatsApp session — supervise() then restarts runOnce(), which
+// triggers a fresh QR pairing flow.
+func (b *Bridge) WatchResetRequests(ctx context.Context) error {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			reset, err := b.pairing.ConsumeResetRequest(ctx)
+			if err != nil {
+				b.logger.Warnf("pairing.ConsumeResetRequest: %v", err)
+				continue
+			}
+			if !reset {
+				continue
+			}
+			b.logger.Infof("Reset requested from web UI — logging out current session")
+			if err := b.client.Logout(ctx); err != nil {
+				b.logger.Warnf("Logout: %v", err)
+			}
+			// Returning here propagates up to supervise(), which will
+			// re-open the tunnel + bridge with a fresh QR flow.
+			return fmt.Errorf("reset requested")
+		}
+	}
 }
 
 func (b *Bridge) Stop() {
