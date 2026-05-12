@@ -22,6 +22,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 type Bridge struct {
@@ -527,5 +528,142 @@ func nullString(s string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: s, Valid: true}
+}
+
+// WatchOutbound polls wa_outbound for pending rows and sends them via
+// whatsmeow. On success it stamps status='sent' + whatsapp_message_id and
+// also inserts a row into wa_messages so the UI sees the outbound message
+// on the next listMessages poll without waiting for an event echo (which
+// whatsmeow doesn't always deliver back to the originating device).
+func (b *Bridge) WatchOutbound(ctx context.Context) error {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if !b.client.IsConnected() {
+				continue
+			}
+			if err := b.processOutboundBatch(ctx); err != nil {
+				b.logger.Warnf("processOutboundBatch: %v", err)
+			}
+		}
+	}
+}
+
+type outboundRow struct {
+	ID              int64
+	ClientRequestID string
+	ChatJID         string
+	Body            string
+}
+
+func (b *Bridge) processOutboundBatch(ctx context.Context) error {
+	rows, err := b.store.DB().QueryContext(ctx, `
+		SELECT id, client_request_id, chat_jid, body
+		FROM wa_outbound
+		WHERE status = 'pending'
+		ORDER BY id
+		LIMIT 10
+	`)
+	if err != nil {
+		return err
+	}
+	var batch []outboundRow
+	for rows.Next() {
+		var r outboundRow
+		if err := rows.Scan(&r.ID, &r.ClientRequestID, &r.ChatJID, &r.Body); err != nil {
+			rows.Close()
+			return err
+		}
+		batch = append(batch, r)
+	}
+	rows.Close()
+
+	for _, r := range batch {
+		b.sendOutboundRow(ctx, r)
+	}
+	return nil
+}
+
+func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
+	chatJID, err := types.ParseJID(r.ChatJID)
+	if err != nil {
+		b.markOutboundFailed(ctx, r.ID, "invalid chat_jid: "+err.Error())
+		return
+	}
+
+	resp, err := b.client.SendMessage(ctx, chatJID, &waProto.Message{
+		Conversation: proto.String(r.Body),
+	})
+	if err != nil {
+		b.markOutboundFailed(ctx, r.ID, err.Error())
+		return
+	}
+
+	// Stamp the outbound row.
+	if _, err := b.store.DB().ExecContext(ctx, `
+		UPDATE wa_outbound
+		SET status = 'sent',
+		    whatsapp_message_id = ?,
+		    sent_at = NOW(),
+		    error_message = NULL
+		WHERE id = ?
+	`, resp.ID, r.ID); err != nil {
+		b.logger.Warnf("Failed to mark outbound %d sent: %v", r.ID, err)
+	}
+
+	// Insert into wa_messages so the UI sees the message right away.
+	msgRow := store.Message{
+		ID:          resp.ID,
+		ChatJID:     r.ChatJID,
+		SenderJID:   nullString(b.selfJID()),
+		FromMe:      true,
+		MessageType: "text",
+		Body:        nullString(r.Body),
+		Timestamp:   resp.Timestamp,
+		Status:      sql.NullString{String: "sent", Valid: true},
+	}
+	if err := b.store.InsertMessage(ctx, msgRow); err != nil {
+		b.logger.Warnf("Insert outbound wa_messages %s: %v", resp.ID, err)
+	}
+
+	// Reflect on chat tail so the chat list re-sorts.
+	chatRow := store.Chat{
+		JID:                r.ChatJID,
+		LastMessageAt:      sql.NullTime{Time: resp.Timestamp, Valid: true},
+		LastMessagePreview: nullString(truncate(r.Body, 160)),
+		LastMessageFromMe:  true,
+		IncrementUnread:    false,
+	}
+	if err := b.store.UpsertChat(ctx, chatRow); err != nil {
+		b.logger.Warnf("Outbound UpsertChat %s: %v", r.ChatJID, err)
+	}
+
+	b.logger.Infof("Sent outbound %d (%s) → %s", r.ID, resp.ID, r.ChatJID)
+}
+
+func (b *Bridge) markOutboundFailed(ctx context.Context, id int64, msg string) {
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	if _, err := b.store.DB().ExecContext(ctx, `
+		UPDATE wa_outbound
+		SET status = 'failed',
+		    error_message = ?
+		WHERE id = ?
+	`, msg, id); err != nil {
+		b.logger.Warnf("Failed to mark outbound %d failed: %v", id, err)
+	}
+}
+
+func (b *Bridge) selfJID() string {
+	if b.client.Store.ID == nil {
+		return ""
+	}
+	return b.client.Store.ID.String()
 }
 
