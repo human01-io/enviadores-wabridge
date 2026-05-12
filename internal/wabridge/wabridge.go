@@ -204,7 +204,7 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	preview := previewFor(msgType, body, mediaInfo)
 	chat := store.Chat{
 		JID:                chatJID,
-		DisplayName:        b.resolveDisplayName(evt),
+		DisplayName:        b.resolveDisplayName(ctx, evt),
 		PhoneE164:          b.resolvePhone(evt),
 		IsGroup:            evt.Info.IsGroup,
 		ProfilePicURL:      b.fetchProfilePicURL(ctx, evt.Info.Chat),
@@ -239,13 +239,35 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	}
 }
 
-func (b *Bridge) resolveDisplayName(evt *events.Message) sql.NullString {
+// resolveDisplayName picks the best human-readable name for the chat.
+// Priority: contact-book FullName → FirstName → BusinessName → PushName
+// from the contact store → PushName on the current message envelope.
+//
+// The phone's address book is synced into whatsmeow_contacts on pair, so
+// for known contacts FullName is what shows up — same as what WhatsApp
+// itself displays in the chat list.
+func (b *Bridge) resolveDisplayName(ctx context.Context, evt *events.Message) sql.NullString {
+	if !evt.Info.IsGroup {
+		if c, err := b.client.Store.Contacts.GetContact(ctx, evt.Info.Chat); err == nil && c.Found {
+			if name := strings.TrimSpace(c.FullName); name != "" {
+				return nullString(name)
+			}
+			if name := strings.TrimSpace(c.FirstName); name != "" {
+				return nullString(name)
+			}
+			if name := strings.TrimSpace(c.BusinessName); name != "" {
+				return nullString(name)
+			}
+			if name := strings.TrimSpace(c.PushName); name != "" {
+				return nullString(name)
+			}
+		}
+	}
+	// Fall back to the PushName on the live message envelope. For groups,
+	// the chat's subject would need GetGroupInfo — left for a later pass.
 	if name := strings.TrimSpace(evt.Info.PushName); name != "" {
 		return nullString(name)
 	}
-	// For groups the chat has its own subject; getting it requires GetGroupInfo
-	// — skipped here for simplicity. The phone number from JID is a usable
-	// fallback.
 	return sql.NullString{}
 }
 
