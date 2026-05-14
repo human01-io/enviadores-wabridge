@@ -261,6 +261,7 @@ type Message struct {
 	MediaSize       sql.NullInt64
 	MediaFilename   sql.NullString
 	MediaSHA256     sql.NullString
+	MediaThumbnailURL sql.NullString
 	QuotedMessageID sql.NullString
 	ClientRequestID sql.NullString // set on outbound sends so the UI can match its optimistic bubble
 	Timestamp       time.Time
@@ -274,13 +275,15 @@ func (s *Store) InsertMessage(ctx context.Context, m Message) error {
 		INSERT IGNORE INTO wa_messages (
 			id, chat_jid, sender_jid, from_me, message_type, body,
 			media_url, media_mime, media_size, media_filename, media_sha256,
+			media_thumbnail_url,
 			quoted_message_id, client_request_id, timestamp, status
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := s.db.ExecContext(ctx, q,
 		m.ID, m.ChatJID, m.SenderJID, boolInt(m.FromMe), m.MessageType, m.Body,
 		m.MediaURL, m.MediaMime, m.MediaSize, m.MediaFilename, m.MediaSHA256,
+		m.MediaThumbnailURL,
 		m.QuotedMessageID, m.ClientRequestID, m.Timestamp.UTC(), m.Status,
 	)
 	return err
