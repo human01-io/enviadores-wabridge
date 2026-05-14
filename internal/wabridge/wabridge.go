@@ -1039,6 +1039,12 @@ type outboundRow struct {
 	ClientRequestID string
 	ChatJID         string
 	Body            string
+	Kind            string // "text", "image", "document", "audio", "video"
+	MediaURL        sql.NullString
+	MediaMime       sql.NullString
+	MediaFilename   sql.NullString
+	MediaSize       sql.NullInt64
+	MediaSHA256     sql.NullString
 	Attempts        int
 }
 
@@ -1053,7 +1059,9 @@ func (b *Bridge) processOutboundBatch(ctx context.Context) error {
 	// SELECT picks it up. Bare 0 for attempts=0 makes brand-new rows
 	// process immediately.
 	rows, err := b.store.DB().QueryContext(ctx, `
-		SELECT id, client_request_id, chat_jid, body, attempts
+		SELECT id, client_request_id, chat_jid, body, kind,
+		       media_url, media_mime, media_filename, media_size, media_sha256,
+		       attempts
 		FROM wa_outbound
 		WHERE status = 'pending'
 		  AND attempts < ?
@@ -1076,7 +1084,11 @@ func (b *Bridge) processOutboundBatch(ctx context.Context) error {
 	var batch []outboundRow
 	for rows.Next() {
 		var r outboundRow
-		if err := rows.Scan(&r.ID, &r.ClientRequestID, &r.ChatJID, &r.Body, &r.Attempts); err != nil {
+		if err := rows.Scan(
+			&r.ID, &r.ClientRequestID, &r.ChatJID, &r.Body, &r.Kind,
+			&r.MediaURL, &r.MediaMime, &r.MediaFilename, &r.MediaSize, &r.MediaSHA256,
+			&r.Attempts,
+		); err != nil {
 			rows.Close()
 			return err
 		}
@@ -1103,9 +1115,16 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	// the matching inbound through LID.
 	storeChatJID := b.canonicalChatJID(ctx, chatJID).String()
 
-	resp, err := b.client.SendMessage(ctx, chatJID, &waProto.Message{
-		Conversation: proto.String(r.Body),
-	})
+	msg, msgType, sendErr := b.buildOutboundMessage(ctx, r)
+	if sendErr != nil {
+		// buildOutboundMessage marks permanent failures itself for bad
+		// configuration; anything that reaches here is transient (SFTP,
+		// upload to WhatsApp CDN) and gets the normal backoff treatment.
+		b.markOutboundAttempt(ctx, r, sendErr.Error())
+		return
+	}
+
+	resp, err := b.client.SendMessage(ctx, chatJID, msg)
 	if err != nil {
 		b.markOutboundAttempt(ctx, r, err.Error())
 		return
@@ -1128,13 +1147,21 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	// its optimistic bubble against this real row deterministically,
 	// regardless of whether send.php has already responded with the
 	// whatsapp_message_id (the two race).
+	//
+	// Media metadata is the public URL the PHP gateway already stored —
+	// not the WhatsApp CDN URL, which is encrypted and useless to the UI.
 	msgRow := store.Message{
 		ID:              resp.ID,
 		ChatJID:         storeChatJID,
 		SenderJID:       nullString(b.selfJID()),
 		FromMe:          true,
-		MessageType:     "text",
+		MessageType:     msgType,
 		Body:            nullString(r.Body),
+		MediaURL:        r.MediaURL,
+		MediaMime:       r.MediaMime,
+		MediaSize:       r.MediaSize,
+		MediaFilename:   r.MediaFilename,
+		MediaSHA256:     r.MediaSHA256,
 		ClientRequestID: nullString(r.ClientRequestID),
 		Timestamp:       resp.Timestamp,
 		Status:          sql.NullString{String: "sent", Valid: true},
@@ -1144,10 +1171,14 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	}
 
 	// Reflect on chat tail so the chat list re-sorts.
+	preview := r.Body
+	if preview == "" {
+		preview = previewForKind(msgType, r.MediaFilename.String)
+	}
 	chatRow := store.Chat{
 		JID:                storeChatJID,
 		LastMessageAt:      sql.NullTime{Time: resp.Timestamp, Valid: true},
-		LastMessagePreview: nullString(truncate(r.Body, 160)),
+		LastMessagePreview: nullString(truncate(preview, 160)),
 		LastMessageFromMe:  true,
 		IncrementUnread:    false,
 	}
@@ -1155,7 +1186,162 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		b.logger.Warnf("Outbound UpsertChat %s: %v", storeChatJID, err)
 	}
 
-	b.logger.Infof("Sent outbound %d (%s) → %s", r.ID, resp.ID, storeChatJID)
+	b.logger.Infof("Sent outbound %d (%s, %s) → %s", r.ID, resp.ID, msgType, storeChatJID)
+}
+
+// buildOutboundMessage materialises the proto message to send for a row,
+// reading any media bytes from the shared SFTP host and uploading them to
+// WhatsApp's CDN. Returns the message, the wa_messages.message_type
+// string to record, and a non-nil error on retryable failure.
+func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waProto.Message, string, error) {
+	kind := r.Kind
+	if kind == "" {
+		kind = "text"
+	}
+
+	if kind == "text" {
+		return &waProto.Message{
+			Conversation: proto.String(r.Body),
+		}, "text", nil
+	}
+
+	mediaType, ok := mediaTypeForKind(kind)
+	if !ok {
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "unsupported kind: "+kind)
+		return nil, "", fmt.Errorf("unsupported kind %q (already marked failed)", kind)
+	}
+	if !r.MediaURL.Valid || r.MediaURL.String == "" {
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "media row missing media_url")
+		return nil, "", fmt.Errorf("media_url missing (already marked failed)")
+	}
+
+	basename := b.uploader.BasenameFromPublicURL(r.MediaURL.String)
+	if basename == "" {
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "media_url not under configured public base")
+		return nil, "", fmt.Errorf("media_url outside public base (already marked failed)")
+	}
+	data, err := b.uploader.Read(basename)
+	if err != nil {
+		return nil, "", fmt.Errorf("read media: %w", err)
+	}
+
+	up, err := b.client.Upload(ctx, data, mediaType)
+	if err != nil {
+		return nil, "", fmt.Errorf("upload to WA CDN: %w", err)
+	}
+
+	mime := r.MediaMime.String
+	switch kind {
+	case "image":
+		return &waProto.Message{
+			ImageMessage: &waProto.ImageMessage{
+				Caption:       protoStringPtrOrNil(r.Body),
+				Mimetype:      proto.String(mime),
+				URL:           &up.URL,
+				DirectPath:    &up.DirectPath,
+				MediaKey:      up.MediaKey,
+				FileEncSHA256: up.FileEncSHA256,
+				FileSHA256:    up.FileSHA256,
+				FileLength:    &up.FileLength,
+			},
+		}, "image", nil
+
+	case "video":
+		return &waProto.Message{
+			VideoMessage: &waProto.VideoMessage{
+				Caption:       protoStringPtrOrNil(r.Body),
+				Mimetype:      proto.String(mime),
+				URL:           &up.URL,
+				DirectPath:    &up.DirectPath,
+				MediaKey:      up.MediaKey,
+				FileEncSHA256: up.FileEncSHA256,
+				FileSHA256:    up.FileSHA256,
+				FileLength:    &up.FileLength,
+			},
+		}, "video", nil
+
+	case "audio":
+		return &waProto.Message{
+			AudioMessage: &waProto.AudioMessage{
+				Mimetype:      proto.String(mime),
+				URL:           &up.URL,
+				DirectPath:    &up.DirectPath,
+				MediaKey:      up.MediaKey,
+				FileEncSHA256: up.FileEncSHA256,
+				FileSHA256:    up.FileSHA256,
+				FileLength:    &up.FileLength,
+			},
+		}, "audio", nil
+
+	case "document":
+		doc := &waProto.DocumentMessage{
+			FileName:      protoStringPtrOrNil(r.MediaFilename.String),
+			Mimetype:      proto.String(mime),
+			URL:           &up.URL,
+			DirectPath:    &up.DirectPath,
+			MediaKey:      up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256,
+			FileSHA256:    up.FileSHA256,
+			FileLength:    &up.FileLength,
+		}
+		// DocumentMessage's own Caption field is ignored by WhatsApp
+		// clients; the supported way to caption a document is to wrap
+		// it in DocumentWithCaptionMessage.
+		if r.Body != "" {
+			return &waProto.Message{
+				DocumentWithCaptionMessage: &waProto.FutureProofMessage{
+					Message: &waProto.Message{
+						DocumentMessage: doc,
+					},
+				},
+			}, "document", nil
+		}
+		return &waProto.Message{DocumentMessage: doc}, "document", nil
+	}
+
+	// Unreachable — mediaTypeForKind already validated kind above.
+	return nil, "", fmt.Errorf("internal: unhandled kind %q", kind)
+}
+
+func mediaTypeForKind(kind string) (whatsmeow.MediaType, bool) {
+	switch kind {
+	case "image":
+		return whatsmeow.MediaImage, true
+	case "video":
+		return whatsmeow.MediaVideo, true
+	case "audio":
+		return whatsmeow.MediaAudio, true
+	case "document":
+		return whatsmeow.MediaDocument, true
+	}
+	return "", false
+}
+
+func protoStringPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return proto.String(s)
+}
+
+// previewForKind returns a chat-list preview when a media message has no
+// caption to use. Mirrors the labels used by the React inbox so the chat
+// list stays consistent across refreshes.
+func previewForKind(kind, filename string) string {
+	switch kind {
+	case "image":
+		return "📷 Imagen"
+	case "video":
+		return "🎬 Video"
+	case "audio":
+		return "🎵 Audio"
+	case "document":
+		if filename != "" {
+			return "📄 " + filename
+		}
+		return "📄 Documento"
+	}
+	return ""
 }
 
 // markOutboundAttempt records a send failure and, if the attempts cap has
