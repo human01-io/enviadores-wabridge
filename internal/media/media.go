@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"mime"
 	"path"
 	"strings"
@@ -64,6 +65,40 @@ func (u *Uploader) Upload(data []byte, mimeType, filename string) (publicURL, sh
 		_ = u.sftp.Remove(tmp)
 	}
 	return u.publicURL(sha + ext), sha, nil
+}
+
+// Read returns the bytes of a file previously stored in remote_path,
+// identified by its basename (e.g. "<sha256>.<ext>"). Used by the
+// outbound sender to load files the PHP gateway dropped into wa_media
+// before re-encrypting them for WhatsApp's CDN. Returns the original
+// plaintext bytes — the file on disk is stored unencrypted.
+func (u *Uploader) Read(basename string) ([]byte, error) {
+	if basename == "" {
+		return nil, fmt.Errorf("read media: empty basename")
+	}
+	remoteFile := path.Join(u.cfg.Media.RemotePath, basename)
+	f, err := u.sftp.Open(remoteFile)
+	if err != nil {
+		return nil, fmt.Errorf("sftp open %s: %w", remoteFile, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("sftp read %s: %w", remoteFile, err)
+	}
+	return data, nil
+}
+
+// BasenameFromPublicURL returns the trailing file segment of a URL that
+// was previously produced by Upload or by the PHP gateway — both share
+// the configured PublicBaseURL prefix. Empty string if the URL doesn't
+// belong to this uploader's public base.
+func (u *Uploader) BasenameFromPublicURL(publicURL string) string {
+	prefix := strings.TrimRight(u.cfg.Media.PublicBaseURL, "/") + "/"
+	if !strings.HasPrefix(publicURL, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(publicURL, prefix)
 }
 
 func (u *Uploader) ensureRemoteDir() error {
