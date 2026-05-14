@@ -402,11 +402,12 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 
 	// Download & upload media if present.
 	var (
-		mediaURL    sql.NullString
-		mediaMime   sql.NullString
-		mediaSize   sql.NullInt64
-		mediaName   sql.NullString
-		mediaSHA256 sql.NullString
+		mediaURL       sql.NullString
+		mediaMime      sql.NullString
+		mediaSize      sql.NullInt64
+		mediaName      sql.NullString
+		mediaSHA256    sql.NullString
+		mediaThumbURL  sql.NullString
 	)
 	if mediaInfo != nil {
 		data, err := b.client.Download(ctx, mediaInfo.downloadable)
@@ -422,6 +423,18 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 				mediaSize = sql.NullInt64{Int64: int64(len(data)), Valid: true}
 				mediaName = nullString(mediaInfo.filename)
 				mediaSHA256 = nullString(sha)
+
+				// Inline thumbnail for the chat bubble — keeps the
+				// React inbox from rendering a generic file-icon card
+				// for PDFs and lets long-tail formats (HEIC, video
+				// frame 0) show a preview without per-format decoders.
+				if thumb, terr := b.deriveInboundThumbnail(ctx, msgType, mediaInfo, data); terr == nil && len(thumb) > 0 {
+					if turl, uerr := b.uploader.UploadThumbnail(sha, thumb); uerr == nil {
+						mediaThumbURL = nullString(turl)
+					} else {
+						b.logger.Warnf("SFTP upload thumb for %s: %v", evt.Info.ID, uerr)
+					}
+				}
 			}
 		}
 	}
@@ -455,7 +468,8 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 		MediaMime:       mediaMime,
 		MediaSize:       mediaSize,
 		MediaFilename:   mediaName,
-		MediaSHA256:     mediaSHA256,
+		MediaSHA256:       mediaSHA256,
+		MediaThumbnailURL: mediaThumbURL,
 		QuotedMessageID: sql.NullString{}, // wired in a later iteration if needed
 		Timestamp:       timestamp,
 		Status:          sql.NullString{String: defaultStatus(fromMe), Valid: true},
@@ -705,19 +719,28 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 		return "text", msg.GetExtendedTextMessage().GetText(), nil
 	case msg.GetImageMessage() != nil:
 		m := msg.GetImageMessage()
-		return "image", m.GetCaption(), &mediaDescriptor{downloadable: m, mime: m.GetMimetype()}
+		return "image", m.GetCaption(), &mediaDescriptor{
+			downloadable:      m,
+			mime:              m.GetMimetype(),
+			embeddedThumbnail: m.GetJPEGThumbnail(),
+		}
 	case msg.GetVideoMessage() != nil:
 		m := msg.GetVideoMessage()
-		return "video", m.GetCaption(), &mediaDescriptor{downloadable: m, mime: m.GetMimetype()}
+		return "video", m.GetCaption(), &mediaDescriptor{
+			downloadable:      m,
+			mime:              m.GetMimetype(),
+			embeddedThumbnail: m.GetJPEGThumbnail(),
+		}
 	case msg.GetAudioMessage() != nil:
 		m := msg.GetAudioMessage()
 		return "audio", "", &mediaDescriptor{downloadable: m, mime: m.GetMimetype()}
 	case msg.GetDocumentMessage() != nil:
 		m := msg.GetDocumentMessage()
 		return "document", m.GetCaption(), &mediaDescriptor{
-			downloadable: m,
-			mime:         m.GetMimetype(),
-			filename:     m.GetFileName(),
+			downloadable:      m,
+			mime:              m.GetMimetype(),
+			filename:          m.GetFileName(),
+			embeddedThumbnail: m.GetJPEGThumbnail(),
 		}
 	case msg.GetStickerMessage() != nil:
 		m := msg.GetStickerMessage()
@@ -833,6 +856,43 @@ type mediaDescriptor struct {
 	downloadable whatsmeow.DownloadableMessage
 	mime         string
 	filename     string
+	// Sender-embedded inline preview, if the proto carried one. We keep
+	// these as the option-1 source for media_thumbnail_url — much cheaper
+	// than rendering our own and works for the long tail of formats
+	// (HEIC, video first frame, doc cover) we can't generate locally.
+	embeddedThumbnail []byte
+}
+
+// deriveInboundThumbnail picks the JPEG bytes we'll persist as the
+// chat-bubble preview for an incoming media message.
+//
+// Priority:
+//  1. Sender-embedded thumbnail from the proto (DocumentMessage.JPEGThumbnail,
+//     etc.) — free, already encoded, works for any sender-rendered format.
+//  2. For PDFs only, fall back to rendering the first page via pdftoppm so
+//     senders whose clients don't pre-render get one anyway.
+//
+// Returns (nil, nil) when neither option produces bytes — that's an
+// expected outcome (e.g. an mp3 attachment, or a PDF on a host without
+// poppler) and not an error worth bubbling up.
+func (b *Bridge) deriveInboundThumbnail(ctx context.Context, msgType string, info *mediaDescriptor, data []byte) ([]byte, error) {
+	if info == nil {
+		return nil, nil
+	}
+	if len(info.embeddedThumbnail) > 0 {
+		return info.embeddedThumbnail, nil
+	}
+	// Only PDFs justify the subprocess cost; other doc types
+	// (Office files, archives) would need format-specific renderers
+	// we're not pulling in.
+	if msgType == "document" && strings.Contains(info.mime, "pdf") {
+		prev, err := media.ExtractPDFPreview(ctx, data)
+		if err != nil {
+			return nil, err
+		}
+		return prev.JPEGThumbnail, nil
+	}
+	return nil, nil
 }
 
 func previewFor(msgType, body string, m *mediaDescriptor) string {
@@ -1115,7 +1175,7 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	// the matching inbound through LID.
 	storeChatJID := b.canonicalChatJID(ctx, chatJID).String()
 
-	msg, msgType, sendErr := b.buildOutboundMessage(ctx, r)
+	msg, msgType, thumbURL, sendErr := b.buildOutboundMessage(ctx, r)
 	if sendErr != nil {
 		// buildOutboundMessage marks permanent failures itself for bad
 		// configuration; anything that reaches here is transient (SFTP,
@@ -1162,6 +1222,7 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		MediaSize:       r.MediaSize,
 		MediaFilename:   r.MediaFilename,
 		MediaSHA256:     r.MediaSHA256,
+		MediaThumbnailURL: thumbURL,
 		ClientRequestID: nullString(r.ClientRequestID),
 		Timestamp:       resp.Timestamp,
 		Status:          sql.NullString{String: "sent", Valid: true},
@@ -1192,8 +1253,11 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 // buildOutboundMessage materialises the proto message to send for a row,
 // reading any media bytes from the shared SFTP host and uploading them to
 // WhatsApp's CDN. Returns the message, the wa_messages.message_type
-// string to record, and a non-nil error on retryable failure.
-func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waProto.Message, string, error) {
+// string to record, an optional thumbnail public URL to persist on the
+// outbound wa_messages row (empty if no thumbnail was generated /
+// uploaded), and a non-nil error on retryable failure.
+func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waProto.Message, string, sql.NullString, error) {
+	var thumbURL sql.NullString
 	kind := r.Kind
 	if kind == "" {
 		kind = "text"
@@ -1202,49 +1266,65 @@ func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waPr
 	if kind == "text" {
 		return &waProto.Message{
 			Conversation: proto.String(r.Body),
-		}, "text", nil
+		}, "text", thumbURL, nil
 	}
 
 	mediaType, ok := mediaTypeForKind(kind)
 	if !ok {
 		b.markOutboundPermanentlyFailed(ctx, r.ID, "unsupported kind: "+kind)
-		return nil, "", fmt.Errorf("unsupported kind %q (already marked failed)", kind)
+		return nil, "", thumbURL, fmt.Errorf("unsupported kind %q (already marked failed)", kind)
 	}
 	if !r.MediaURL.Valid || r.MediaURL.String == "" {
 		b.markOutboundPermanentlyFailed(ctx, r.ID, "media row missing media_url")
-		return nil, "", fmt.Errorf("media_url missing (already marked failed)")
+		return nil, "", thumbURL, fmt.Errorf("media_url missing (already marked failed)")
 	}
 
 	basename := b.uploader.BasenameFromPublicURL(r.MediaURL.String)
 	if basename == "" {
 		b.markOutboundPermanentlyFailed(ctx, r.ID, "media_url not under configured public base")
-		return nil, "", fmt.Errorf("media_url outside public base (already marked failed)")
+		return nil, "", thumbURL, fmt.Errorf("media_url outside public base (already marked failed)")
 	}
 	data, err := b.uploader.Read(basename)
 	if err != nil {
-		return nil, "", fmt.Errorf("read media: %w", err)
+		return nil, "", thumbURL, fmt.Errorf("read media: %w", err)
 	}
 
 	up, err := b.client.Upload(ctx, data, mediaType)
 	if err != nil {
-		return nil, "", fmt.Errorf("upload to WA CDN: %w", err)
+		return nil, "", thumbURL, fmt.Errorf("upload to WA CDN: %w", err)
 	}
 
 	mime := r.MediaMime.String
 	switch kind {
 	case "image":
-		return &waProto.Message{
-			ImageMessage: &waProto.ImageMessage{
-				Caption:       protoStringPtrOrNil(r.Body),
-				Mimetype:      proto.String(mime),
-				URL:           &up.URL,
-				DirectPath:    &up.DirectPath,
-				MediaKey:      up.MediaKey,
-				FileEncSHA256: up.FileEncSHA256,
-				FileSHA256:    up.FileSHA256,
-				FileLength:    &up.FileLength,
-			},
-		}, "image", nil
+		img := &waProto.ImageMessage{
+			Caption:       protoStringPtrOrNil(r.Body),
+			Mimetype:      proto.String(mime),
+			URL:           &up.URL,
+			DirectPath:    &up.DirectPath,
+			MediaKey:      up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256,
+			FileSHA256:    up.FileSHA256,
+			FileLength:    &up.FileLength,
+		}
+		// Inline JPEG thumbnail + dimensions are what makes WhatsApp
+		// render an actual preview in chat instead of a gray placeholder
+		// that the recipient has to tap to download. Thumbnail
+		// generation is best-effort — an unknown image format (e.g.
+		// HEIC, which Go's stdlib can't decode) just sends without a
+		// preview rather than failing the whole message.
+		//
+		// The image bubble in our React UI uses media_url directly
+		// (full-res image), so we don't bother persisting the thumbnail
+		// for outbound images — the sender already sees the file inline.
+		if thumb, w, h, terr := media.MakeImageThumbnail(data); terr == nil {
+			img.JPEGThumbnail = thumb
+			wu, hu := uint32(w), uint32(h)
+			img.Width, img.Height = &wu, &hu
+		} else {
+			b.logger.Warnf("Outbound %d: thumbnail skipped (%s): %v", r.ID, mime, terr)
+		}
+		return &waProto.Message{ImageMessage: img}, "image", thumbURL, nil
 
 	case "video":
 		return &waProto.Message{
@@ -1258,7 +1338,7 @@ func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waPr
 				FileSHA256:    up.FileSHA256,
 				FileLength:    &up.FileLength,
 			},
-		}, "video", nil
+		}, "video", thumbURL, nil
 
 	case "audio":
 		return &waProto.Message{
@@ -1271,7 +1351,7 @@ func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waPr
 				FileSHA256:    up.FileSHA256,
 				FileLength:    &up.FileLength,
 			},
-		}, "audio", nil
+		}, "audio", thumbURL, nil
 
 	case "document":
 		doc := &waProto.DocumentMessage{
@@ -1284,6 +1364,46 @@ func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waPr
 			FileSHA256:    up.FileSHA256,
 			FileLength:    &up.FileLength,
 		}
+		// Title is the human-readable name WhatsApp displays on the
+		// document card; default it to the original filename so the
+		// recipient sees something sensible even when pdfinfo doesn't
+		// surface a Title metadata field.
+		if r.MediaFilename.String != "" {
+			doc.Title = proto.String(r.MediaFilename.String)
+		}
+		// PDF cover thumbnail + page count is what turns the document
+		// card from a generic paper-clip blob into a real first-page
+		// preview. Best-effort — when poppler isn't installed we just
+		// send the document without a preview.
+		//
+		// We also persist the rendered thumbnail to SFTP so the sender's
+		// own chat (rendered by the React UI from wa_messages) shows
+		// the same cover the recipient will see.
+		if strings.Contains(mime, "pdf") {
+			if prev, err := media.ExtractPDFPreview(ctx, data); err == nil {
+				if prev.PageCount > 0 {
+					pc := uint32(prev.PageCount)
+					doc.PageCount = &pc
+				}
+				if prev.Title != "" {
+					doc.Title = proto.String(prev.Title)
+				}
+				if len(prev.JPEGThumbnail) > 0 {
+					doc.JPEGThumbnail = prev.JPEGThumbnail
+					tw, th := uint32(prev.ThumbnailWidth), uint32(prev.ThumbnailHeight)
+					doc.ThumbnailWidth, doc.ThumbnailHeight = &tw, &th
+					if r.MediaSHA256.Valid && r.MediaSHA256.String != "" {
+						if turl, uerr := b.uploader.UploadThumbnail(r.MediaSHA256.String, prev.JPEGThumbnail); uerr == nil {
+							thumbURL = nullString(turl)
+						} else {
+							b.logger.Warnf("Outbound %d: SFTP upload thumb: %v", r.ID, uerr)
+						}
+					}
+				}
+			} else {
+				b.logger.Warnf("Outbound %d: PDF preview skipped: %v", r.ID, err)
+			}
+		}
 		// DocumentMessage's own Caption field is ignored by WhatsApp
 		// clients; the supported way to caption a document is to wrap
 		// it in DocumentWithCaptionMessage.
@@ -1294,13 +1414,13 @@ func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waPr
 						DocumentMessage: doc,
 					},
 				},
-			}, "document", nil
+			}, "document", thumbURL, nil
 		}
-		return &waProto.Message{DocumentMessage: doc}, "document", nil
+		return &waProto.Message{DocumentMessage: doc}, "document", thumbURL, nil
 	}
 
 	// Unreachable — mediaTypeForKind already validated kind above.
-	return nil, "", fmt.Errorf("internal: unhandled kind %q", kind)
+	return nil, "", thumbURL, fmt.Errorf("internal: unhandled kind %q", kind)
 }
 
 func mediaTypeForKind(kind string) (whatsmeow.MediaType, bool) {
