@@ -33,6 +33,7 @@ type Bridge struct {
 	uploader *media.Uploader
 	client   *whatsmeow.Client
 	logger   waLog.Logger
+	fatalCh  chan error
 }
 
 func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, error) {
@@ -62,6 +63,7 @@ func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Upl
 		uploader: up,
 		client:   client,
 		logger:   clientLog,
+		fatalCh:  make(chan error, 1),
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -156,16 +158,84 @@ func (b *Bridge) handleEvent(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Connected:
 		b.logger.Infof("Connected to WhatsApp")
+		// Mark online so the server starts forwarding ChatPresence
+		// (typing) events. This makes the session visible as
+		// "online"/last-seen to all contacts — a known trade-off of
+		// enabling the typing feature.
+		go b.markOnline(context.Background())
+		// Flush any peer_typing_until rows left over from a previous
+		// session: we have no way to know if those contacts are
+		// still composing.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := b.store.ClearAllPeerTyping(ctx); err != nil {
+			b.logger.Warnf("ClearAllPeerTyping: %v", err)
+		}
+	case *events.ChatPresence:
+		b.handleChatPresence(v)
 	case *events.Disconnected:
-		b.logger.Warnf("Disconnected from WhatsApp")
+		// whatsmeow auto-reconnects on transient drops; the watchdog in
+		// WatchConnection() escalates to a full restart if the gap
+		// outlasts whatsmeow's own retries.
+		b.logger.Warnf("Disconnected from WhatsApp (whatsmeow will retry)")
 	case *events.LoggedOut:
-		b.logger.Errorf("Logged out: %s — re-pair required", v.Reason)
+		// Terminal: the WhatsApp server has revoked our session (user
+		// removed the device, security flag, etc.). whatsmeow has
+		// already cleared the local device store; bounce supervise()
+		// so the next runOnce() starts a fresh QR flow.
+		b.logger.Errorf("Logged out: %s — triggering bridge restart", v.Reason)
+		b.signalFatal(fmt.Errorf("logged out: %s", v.Reason))
+	case *events.Receipt:
+		b.handleReceipt(v)
 	case *events.Message:
 		b.handleMessage(v)
 	case *events.HistorySync:
 		// History sync can carry thousands of messages; offload to a
 		// goroutine so we don't block subsequent live events.
 		go b.handleHistorySync(v)
+	}
+}
+
+// Fatal returns a channel that receives an error when the bridge needs to
+// be torn down and re-started from scratch (LoggedOut, or a prolonged
+// disconnect that whatsmeow's own backoff didn't recover from).
+func (b *Bridge) Fatal() <-chan error { return b.fatalCh }
+
+func (b *Bridge) signalFatal(err error) {
+	select {
+	case b.fatalCh <- err:
+	default: // already signalled, drop
+	}
+}
+
+// WatchConnection escalates a stuck disconnect to a full bridge restart.
+// whatsmeow has internal reconnect logic but it can wedge after long
+// network outages or remote socket resets; if IsConnected() stays false
+// for more than the threshold, we return an error so supervise() can
+// rebuild the tunnel + client from scratch.
+func (b *Bridge) WatchConnection(ctx context.Context) error {
+	const checkInterval = 30 * time.Second
+	const disconnectThreshold = 5 * time.Minute
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	var disconnectedSince time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if b.client.IsConnected() {
+				disconnectedSince = time.Time{}
+				continue
+			}
+			if disconnectedSince.IsZero() {
+				disconnectedSince = time.Now()
+				continue
+			}
+			if time.Since(disconnectedSince) >= disconnectThreshold {
+				return fmt.Errorf("disconnected for >%s — restarting", disconnectThreshold)
+			}
+		}
 	}
 }
 
@@ -192,18 +262,27 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 		default:
 		}
 
-		chatJIDStr := conv.GetID()
-		chatJID, err := types.ParseJID(chatJIDStr)
+		rawChatJID, err := types.ParseJID(conv.GetID())
 		if err != nil {
-			b.logger.Warnf("History sync: bad JID %s: %v", chatJIDStr, err)
+			b.logger.Warnf("History sync: bad JID %s: %v", conv.GetID(), err)
 			continue
 		}
+		// Canonicalize PN → LID for the storage keys so history-sync rows
+		// land on the same JID the real-time path will subsequently use.
+		// Keep the raw JID for ParseWebMessage so any sender lookups inside
+		// the parser see the form WhatsApp actually delivered.
+		chatJID := b.canonicalChatJID(ctx, rawChatJID)
+		chatJIDStr := chatJID.String()
 		isGroup := chatJID.Server == types.GroupServer
 
 		displayName := b.resolveDisplayNameForJID(ctx, chatJID, conv.GetName())
 		phoneE164 := sql.NullString{}
 		if chatJID.Server == types.DefaultUserServer && chatJID.User != "" {
 			phoneE164 = nullString("+" + chatJID.User)
+		} else if chatJID.Server == types.HiddenUserServer {
+			if pn := b.resolvePNForLID(ctx, chatJID); !pn.IsEmpty() && pn.User != "" {
+				phoneE164 = nullString("+" + pn.User)
+			}
 		}
 
 		// Initial upsert with no last_message_* — we'll fill those after
@@ -227,12 +306,15 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 			if webMsg == nil {
 				continue
 			}
-			parsed, err := b.client.ParseWebMessage(chatJID, webMsg)
+			parsed, err := b.client.ParseWebMessage(rawChatJID, webMsg)
 			if err != nil {
 				continue
 			}
 
 			msgType, body, mediaInfo := classifyMessage(parsed.Message)
+			if msgType == "system" {
+				continue
+			}
 
 			var mediaName, mediaMime sql.NullString
 			if mediaInfo != nil {
@@ -283,20 +365,15 @@ func (b *Bridge) resolveDisplayNameForJID(ctx context.Context, jid types.JID, co
 	if name := strings.TrimSpace(convName); name != "" {
 		return nullString(name)
 	}
-	if jid.Server != types.GroupServer {
-		if c, err := b.client.Store.Contacts.GetContact(ctx, jid); err == nil && c.Found {
-			if name := strings.TrimSpace(c.FullName); name != "" {
-				return nullString(name)
-			}
-			if name := strings.TrimSpace(c.FirstName); name != "" {
-				return nullString(name)
-			}
-			if name := strings.TrimSpace(c.BusinessName); name != "" {
-				return nullString(name)
-			}
-			if name := strings.TrimSpace(c.PushName); name != "" {
-				return nullString(name)
-			}
+	if jid.Server == types.GroupServer {
+		return sql.NullString{}
+	}
+	if name := b.contactNameForJID(ctx, jid); name != "" {
+		return nullString(name)
+	}
+	if pn := b.resolvePNForLID(ctx, jid); !pn.IsEmpty() {
+		if name := b.contactNameForJID(ctx, pn); name != "" {
+			return nullString(name)
 		}
 	}
 	return sql.NullString{}
@@ -306,12 +383,22 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	chatJID := evt.Info.Chat.String()
+	// Normalize the chat JID to its canonical form before any DB write so
+	// LID/PN dupes can never accumulate in wa_chats again.
+	canonicalChat := b.canonicalChatJID(ctx, evt.Info.Chat)
+	chatJID := canonicalChat.String()
 	senderJID := evt.Info.Sender.String()
 	fromMe := evt.Info.IsFromMe
 	timestamp := evt.Info.Timestamp
 
 	msgType, body, mediaInfo := classifyMessage(evt.Message)
+	// 'system' rows are E2E protocol envelopes (SenderKeyDistribution
+	// etc.) — never user-facing. Skipping them here keeps wa_chats
+	// tail metadata (last_message_at / preview / from_me) honest
+	// instead of advancing to a row the UI hides anyway.
+	if msgType == "system" {
+		return
+	}
 
 	// Download & upload media if present.
 	var (
@@ -344,9 +431,9 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	chat := store.Chat{
 		JID:                chatJID,
 		DisplayName:        b.resolveDisplayName(ctx, evt),
-		PhoneE164:          b.resolvePhone(evt),
+		PhoneE164:          b.resolvePhone(ctx, evt),
 		IsGroup:            evt.Info.IsGroup,
-		ProfilePicURL:      b.fetchProfilePicURL(ctx, evt.Info.Chat),
+		ProfilePicURL:      b.fetchProfilePicURL(ctx, canonicalChat),
 		LastMessageAt:      sql.NullTime{Time: timestamp, Valid: true},
 		LastMessagePreview: nullString(preview),
 		LastMessageFromMe:  fromMe,
@@ -378,26 +465,168 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	}
 }
 
+// markOnline tells WhatsApp we're available. Without it the server
+// won't push ChatPresence events to us. Refreshes every 5 minutes —
+// whatsmeow doesn't expose the exact timeout but the protocol's
+// available state is treated as ephemeral and benefits from periodic
+// reassertion.
+func (b *Bridge) markOnline(ctx context.Context) {
+	send := func() {
+		if !b.client.IsConnected() {
+			return
+		}
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := b.client.SendPresence(cctx, types.PresenceAvailable); err != nil {
+			b.logger.Warnf("SendPresence(Available): %v", err)
+		}
+	}
+	send()
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
+// handleChatPresence persists peer typing state. Composing stamps a
+// future expiry on wa_chats; paused (or any other state) clears it.
+// The window is short — whatsmeow refreshes composing every few seconds
+// for as long as the contact is typing, so we don't need a long TTL.
+func (b *Bridge) handleChatPresence(evt *events.ChatPresence) {
+	const composingTTL = 15 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Canonicalize so the typing flag lands on the same wa_chats row that
+	// inbound/outbound messages use.
+	chatJID := b.canonicalChatJID(ctx, evt.Chat).String()
+	switch evt.State {
+	case types.ChatPresenceComposing:
+		until := time.Now().UTC().Add(composingTTL)
+		if err := b.store.SetPeerTyping(ctx, chatJID, &until); err != nil {
+			b.logger.Warnf("SetPeerTyping composing %s: %v", chatJID, err)
+		}
+	default:
+		if err := b.store.SetPeerTyping(ctx, chatJID, nil); err != nil {
+			b.logger.Warnf("SetPeerTyping paused %s: %v", chatJID, err)
+		}
+	}
+}
+
+// handleReceipt processes delivery/read receipts for outbound messages. A
+// single receipt may carry multiple message IDs; whatsmeow's Type field
+// distinguishes delivered vs read (empty Type is delivered).
+func (b *Bridge) handleReceipt(evt *events.Receipt) {
+	if len(evt.MessageIDs) == 0 {
+		return
+	}
+	var newStatus string
+	switch evt.Type {
+	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf, types.ReceiptTypePlayed:
+		newStatus = "read"
+	case types.ReceiptTypeDelivered:
+		// ReceiptTypeDelivered is the empty string in whatsmeow; this
+		// case also catches receipts where the field was omitted.
+		newStatus = "delivered"
+	default:
+		// Sender / Retry / others — not user-facing status transitions.
+		return
+	}
+	ids := make([]string, 0, len(evt.MessageIDs))
+	for _, id := range evt.MessageIDs {
+		ids = append(ids, string(id))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.store.MarkMessagesStatus(ctx, ids, newStatus); err != nil {
+		b.logger.Warnf("MarkMessagesStatus (%s, %d ids): %v", newStatus, len(ids), err)
+	}
+}
+
+// resolvePNForLID returns the phone-number JID associated with an @lid
+// JID, if whatsmeow has the mapping cached. Empty/zero JID means we
+// don't know it yet; callers should fall back to the LID-only path.
+func (b *Bridge) resolvePNForLID(ctx context.Context, lid types.JID) types.JID {
+	if lid.Server != types.HiddenUserServer {
+		return types.EmptyJID
+	}
+	pn, err := b.client.Store.LIDs.GetPNForLID(ctx, lid)
+	if err != nil {
+		return types.EmptyJID
+	}
+	return pn
+}
+
+// canonicalChatJID picks one JID per chat, so wa_chats never sprouts a
+// duplicate when WhatsApp routes the same conversation through both its
+// PN (<phone>@s.whatsapp.net) and LID (<id>@lid) forms.
+//
+// LID is WhatsApp's long-term identifier — phone-hiding by design and
+// stable even if the contact changes number. We rewrite PN → LID when
+// whatsmeow's LID store knows the mapping, and otherwise fall through to
+// the raw JID (first-contact case where the mapping hasn't been learned
+// yet). Groups and other server types are passed through unchanged.
+//
+// See migrations/2026_05_13_wa_chats_merge_lid_pn_dupes.sql for the
+// one-shot backfill that cleaned up dupes created before this normalization
+// existed.
+func (b *Bridge) canonicalChatJID(ctx context.Context, raw types.JID) types.JID {
+	if raw.Server != types.DefaultUserServer || raw.User == "" {
+		return raw
+	}
+	lid, err := b.client.Store.LIDs.GetLIDForPN(ctx, raw)
+	if err != nil || lid.IsEmpty() || lid.User == "" {
+		return raw
+	}
+	return lid
+}
+
+// contactNameForJID consults whatsmeow's contact store for the best
+// human-readable label, in the order WhatsApp itself uses: full name →
+// first name → business name → push name. Returns "" when nothing is
+// known.
+func (b *Bridge) contactNameForJID(ctx context.Context, jid types.JID) string {
+	c, err := b.client.Store.Contacts.GetContact(ctx, jid)
+	if err != nil || !c.Found {
+		return ""
+	}
+	if s := strings.TrimSpace(c.FullName); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(c.FirstName); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(c.BusinessName); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(c.PushName); s != "" {
+		return s
+	}
+	return ""
+}
+
 // resolveDisplayName picks the best human-readable name for the chat.
-// Priority: contact-book FullName → FirstName → BusinessName → PushName
-// from the contact store → PushName on the current message envelope.
+// Priority: contact-book name on the chat JID → contact-book name on
+// the LID-mapped PN JID (so LID-only chats inherit the address-book
+// entry) → envelope PushName for inbound messages.
 //
 // The phone's address book is synced into whatsmeow_contacts on pair, so
 // for known contacts FullName is what shows up — same as what WhatsApp
 // itself displays in the chat list.
 func (b *Bridge) resolveDisplayName(ctx context.Context, evt *events.Message) sql.NullString {
 	if !evt.Info.IsGroup {
-		if c, err := b.client.Store.Contacts.GetContact(ctx, evt.Info.Chat); err == nil && c.Found {
-			if name := strings.TrimSpace(c.FullName); name != "" {
-				return nullString(name)
-			}
-			if name := strings.TrimSpace(c.FirstName); name != "" {
-				return nullString(name)
-			}
-			if name := strings.TrimSpace(c.BusinessName); name != "" {
-				return nullString(name)
-			}
-			if name := strings.TrimSpace(c.PushName); name != "" {
+		if name := b.contactNameForJID(ctx, evt.Info.Chat); name != "" {
+			return nullString(name)
+		}
+		// LID chats hide the phone, so contact lookup on the LID JID
+		// usually misses. Fall through to the PN mapping if we know it.
+		if pn := b.resolvePNForLID(ctx, evt.Info.Chat); !pn.IsEmpty() {
+			if name := b.contactNameForJID(ctx, pn); name != "" {
 				return nullString(name)
 			}
 		}
@@ -414,10 +643,19 @@ func (b *Bridge) resolveDisplayName(ctx context.Context, evt *events.Message) sq
 	return sql.NullString{}
 }
 
-func (b *Bridge) resolvePhone(evt *events.Message) sql.NullString {
+// resolvePhone returns the +E.164 number for the chat. For phone-number
+// JIDs that's trivial; for @lid JIDs we ask whatsmeow's LID store for
+// the mapped PN so the chat list can show the phone (and the name
+// fallback chain can lookup the address book).
+func (b *Bridge) resolvePhone(ctx context.Context, evt *events.Message) sql.NullString {
 	chat := evt.Info.Chat
 	if chat.Server == types.DefaultUserServer && chat.User != "" {
 		return nullString("+" + chat.User)
+	}
+	if chat.Server == types.HiddenUserServer {
+		if pn := b.resolvePNForLID(ctx, chat); !pn.IsEmpty() && pn.User != "" {
+			return nullString("+" + pn.User)
+		}
 	}
 	return sql.NullString{}
 }
@@ -648,6 +886,127 @@ func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
+// WatchProfilePics periodically refreshes wa_chats.profile_pic_url for
+// non-group chats whose stored URL is approaching its 24-48h WhatsApp
+// signed-URL expiry. The frontend falls back to initials on 404 so a
+// stale URL doesn't break the UI, but a fresh one keeps avatars visible
+// in quiet chats that no longer trigger UpsertChat on each message.
+func (b *Bridge) WatchProfilePics(ctx context.Context) error {
+	// First sweep ~5min after start (lets the initial history sync settle
+	// without us contesting CPU/network), then every 30min thereafter.
+	// Refresh anything older than ~18h, well under WhatsApp's 24h floor.
+	const staleAfter = 18 * time.Hour
+	const batchLimit = 30
+	timer := time.NewTimer(5 * time.Minute)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			if b.client.IsConnected() {
+				b.refreshStaleProfilePics(ctx, staleAfter, batchLimit)
+			}
+			timer.Reset(30 * time.Minute)
+		}
+	}
+}
+
+func (b *Bridge) refreshStaleProfilePics(ctx context.Context, staleAfter time.Duration, limit int) {
+	jids, err := b.store.FindStaleProfilePics(ctx, staleAfter, limit)
+	if err != nil {
+		b.logger.Warnf("FindStaleProfilePics: %v", err)
+		return
+	}
+	if len(jids) == 0 {
+		return
+	}
+	b.logger.Infof("Refreshing %d stale profile pic URL(s)", len(jids))
+	refreshed := 0
+	for _, jidStr := range jids {
+		if ctx.Err() != nil {
+			return
+		}
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			continue
+		}
+		pic, err := b.client.GetProfilePictureInfo(ctx, jid, nil)
+		newURL := ""
+		if err == nil && pic != nil {
+			newURL = pic.URL
+		}
+		if err := b.store.UpdateProfilePic(ctx, jidStr, newURL); err != nil {
+			b.logger.Warnf("UpdateProfilePic %s: %v", jidStr, err)
+			continue
+		}
+		if newURL != "" {
+			refreshed++
+		}
+		// Tiny pause to avoid hammering WhatsApp's profile-pic endpoint
+		// when there's a big backlog (first run after the column lands
+		// will sweep every chat).
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	b.logger.Infof("Profile pic refresh: %d/%d entries got new URLs", refreshed, len(jids))
+}
+
+// WatchTypingOutbound flushes queued ChatPresence requests written by
+// the React inbox into WhatsApp. Atomic drain-and-delete: each tick
+// reads whatever rows are in wa_typing_outbound, deletes them, then
+// calls SendChatPresence outside the DB transaction. Lossy on purpose —
+// presence is ephemeral; a dropped state will be superseded by the
+// next keystroke or by the natural TTL.
+func (b *Bridge) WatchTypingOutbound(ctx context.Context) error {
+	// 500ms is fast enough that "starts typing" feels live without
+	// pegging MySQL. We also short-circuit when not connected.
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if !b.client.IsConnected() {
+				continue
+			}
+			b.flushTypingOutbound(ctx)
+		}
+	}
+}
+
+func (b *Bridge) flushTypingOutbound(ctx context.Context) {
+	batch, err := b.store.DrainTypingOutbound(ctx, 25)
+	if err != nil {
+		b.logger.Warnf("DrainTypingOutbound: %v", err)
+		return
+	}
+	for _, r := range batch {
+		jid, err := types.ParseJID(r.ChatJID)
+		if err != nil {
+			b.logger.Warnf("Typing outbound: bad JID %s: %v", r.ChatJID, err)
+			continue
+		}
+		var state types.ChatPresence
+		switch r.State {
+		case "composing":
+			state = types.ChatPresenceComposing
+		case "paused":
+			state = types.ChatPresencePaused
+		default:
+			continue
+		}
+		if err := b.client.SendChatPresence(ctx, jid, state, types.ChatPresenceMediaText); err != nil {
+			// Not retried — the next keystroke will refresh.
+			b.logger.Warnf("SendChatPresence %s %s: %v", r.ChatJID, state, err)
+		}
+	}
+}
+
 // WatchOutbound polls wa_outbound for pending rows and sends them via
 // whatsmeow. On success it stamps status='sent' + whatsapp_message_id and
 // also inserts a row into wa_messages so the UI sees the outbound message
@@ -680,23 +1039,44 @@ type outboundRow struct {
 	ClientRequestID string
 	ChatJID         string
 	Body            string
+	Attempts        int
 }
 
+// Cap on retries before we permanently mark a row 'failed'. Tuned with
+// the backoff schedule below to ~9 minutes of total elapsed time before
+// giving up (10 + 30 + 60 + 120 + 300 ≈ 520s).
+const outboundMaxAttempts = 5
+
 func (b *Bridge) processOutboundBatch(ctx context.Context) error {
+	// The CASE expression mirrors the per-attempt backoff: a row that's
+	// failed N times waits backoffForAttempt(N) seconds before its next
+	// SELECT picks it up. Bare 0 for attempts=0 makes brand-new rows
+	// process immediately.
 	rows, err := b.store.DB().QueryContext(ctx, `
-		SELECT id, client_request_id, chat_jid, body
+		SELECT id, client_request_id, chat_jid, body, attempts
 		FROM wa_outbound
 		WHERE status = 'pending'
+		  AND attempts < ?
+		  AND (
+		    last_attempt_at IS NULL
+		    OR last_attempt_at < (UTC_TIMESTAMP() - INTERVAL (CASE attempts
+		        WHEN 0 THEN 0
+		        WHEN 1 THEN 10
+		        WHEN 2 THEN 30
+		        WHEN 3 THEN 60
+		        WHEN 4 THEN 120
+		        ELSE 300 END) SECOND)
+		  )
 		ORDER BY id
 		LIMIT 10
-	`)
+	`, outboundMaxAttempts)
 	if err != nil {
 		return err
 	}
 	var batch []outboundRow
 	for rows.Next() {
 		var r outboundRow
-		if err := rows.Scan(&r.ID, &r.ClientRequestID, &r.ChatJID, &r.Body); err != nil {
+		if err := rows.Scan(&r.ID, &r.ClientRequestID, &r.ChatJID, &r.Body, &r.Attempts); err != nil {
 			rows.Close()
 			return err
 		}
@@ -713,15 +1093,21 @@ func (b *Bridge) processOutboundBatch(ctx context.Context) error {
 func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	chatJID, err := types.ParseJID(r.ChatJID)
 	if err != nil {
-		b.markOutboundFailed(ctx, r.ID, "invalid chat_jid: "+err.Error())
+		// Bad JID is not a transient error — no point retrying.
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "invalid chat_jid: "+err.Error())
 		return
 	}
+
+	// Storage key for wa_chats / wa_messages: canonicalize so an outbound
+	// row queued under PN doesn't recreate a PN twin if WhatsApp routes
+	// the matching inbound through LID.
+	storeChatJID := b.canonicalChatJID(ctx, chatJID).String()
 
 	resp, err := b.client.SendMessage(ctx, chatJID, &waProto.Message{
 		Conversation: proto.String(r.Body),
 	})
 	if err != nil {
-		b.markOutboundFailed(ctx, r.ID, err.Error())
+		b.markOutboundAttempt(ctx, r, err.Error())
 		return
 	}
 
@@ -744,7 +1130,7 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	// whatsapp_message_id (the two race).
 	msgRow := store.Message{
 		ID:              resp.ID,
-		ChatJID:         r.ChatJID,
+		ChatJID:         storeChatJID,
 		SenderJID:       nullString(b.selfJID()),
 		FromMe:          true,
 		MessageType:     "text",
@@ -759,30 +1145,71 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 
 	// Reflect on chat tail so the chat list re-sorts.
 	chatRow := store.Chat{
-		JID:                r.ChatJID,
+		JID:                storeChatJID,
 		LastMessageAt:      sql.NullTime{Time: resp.Timestamp, Valid: true},
 		LastMessagePreview: nullString(truncate(r.Body, 160)),
 		LastMessageFromMe:  true,
 		IncrementUnread:    false,
 	}
 	if err := b.store.UpsertChat(ctx, chatRow); err != nil {
-		b.logger.Warnf("Outbound UpsertChat %s: %v", r.ChatJID, err)
+		b.logger.Warnf("Outbound UpsertChat %s: %v", storeChatJID, err)
 	}
 
-	b.logger.Infof("Sent outbound %d (%s) → %s", r.ID, resp.ID, r.ChatJID)
+	b.logger.Infof("Sent outbound %d (%s) → %s", r.ID, resp.ID, storeChatJID)
 }
 
-func (b *Bridge) markOutboundFailed(ctx context.Context, id int64, msg string) {
+// markOutboundAttempt records a send failure and, if the attempts cap has
+// been reached, transitions the row to status='failed'. Otherwise the row
+// stays 'pending' and the next processOutboundBatch tick (after the
+// per-attempt backoff window) will retry it.
+func (b *Bridge) markOutboundAttempt(ctx context.Context, r outboundRow, msg string) {
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	nextAttempts := r.Attempts + 1
+	if nextAttempts >= outboundMaxAttempts {
+		if _, err := b.store.DB().ExecContext(ctx, `
+			UPDATE wa_outbound
+			SET status = 'failed',
+			    attempts = ?,
+			    last_attempt_at = UTC_TIMESTAMP(),
+			    error_message = ?
+			WHERE id = ?
+		`, nextAttempts, msg, r.ID); err != nil {
+			b.logger.Warnf("Failed to mark outbound %d failed: %v", r.ID, err)
+			return
+		}
+		b.logger.Warnf("Outbound %d permanently failed after %d attempts: %s", r.ID, nextAttempts, msg)
+		return
+	}
+	if _, err := b.store.DB().ExecContext(ctx, `
+		UPDATE wa_outbound
+		SET attempts = ?,
+		    last_attempt_at = UTC_TIMESTAMP(),
+		    error_message = ?
+		WHERE id = ?
+	`, nextAttempts, msg, r.ID); err != nil {
+		b.logger.Warnf("Failed to bump attempts on outbound %d: %v", r.ID, err)
+		return
+	}
+	b.logger.Infof("Outbound %d attempt %d/%d failed: %s — will retry", r.ID, nextAttempts, outboundMaxAttempts, msg)
+}
+
+// markOutboundPermanentlyFailed terminates retries immediately. Use for
+// errors that won't fix themselves on the next try (bad JID, etc.).
+func (b *Bridge) markOutboundPermanentlyFailed(ctx context.Context, id int64, msg string) {
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
 	if _, err := b.store.DB().ExecContext(ctx, `
 		UPDATE wa_outbound
 		SET status = 'failed',
+		    attempts = ?,
+		    last_attempt_at = UTC_TIMESTAMP(),
 		    error_message = ?
 		WHERE id = ?
-	`, msg, id); err != nil {
-		b.logger.Warnf("Failed to mark outbound %d failed: %v", id, err)
+	`, outboundMaxAttempts, msg, id); err != nil {
+		b.logger.Warnf("Failed to mark outbound %d permanently failed: %v", id, err)
 	}
 }
 

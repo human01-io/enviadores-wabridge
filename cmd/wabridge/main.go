@@ -171,7 +171,9 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("start whatsmeow: %w", err)
 	}
 
-	// Block until any of: tunnel dies, web UI requests reset, outbound watcher dies, or we're cancelled.
+	// Block until any of: tunnel dies, web UI requests reset, outbound
+	// watcher dies, connection watchdog escalates, fatal bridge event
+	// (e.g. LoggedOut), or we're cancelled.
 	tunnelDone := make(chan error, 1)
 	go func() { tunnelDone <- tun.Wait() }()
 
@@ -180,6 +182,15 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 
 	outboundDone := make(chan error, 1)
 	go func() { outboundDone <- bridge.WatchOutbound(ctx) }()
+
+	connDone := make(chan error, 1)
+	go func() { connDone <- bridge.WatchConnection(ctx) }()
+
+	picsDone := make(chan error, 1)
+	go func() { picsDone <- bridge.WatchProfilePics(ctx) }()
+
+	typingDone := make(chan error, 1)
+	go func() { typingDone <- bridge.WatchTypingOutbound(ctx) }()
 
 	select {
 	case <-ctx.Done():
@@ -192,6 +203,14 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 	case err := <-resetDone:
 		return err
 	case err := <-outboundDone:
+		return err
+	case err := <-connDone:
+		return err
+	case err := <-picsDone:
+		return err
+	case err := <-typingDone:
+		return err
+	case err := <-bridge.Fatal():
 		return err
 	}
 }

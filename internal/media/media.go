@@ -91,21 +91,30 @@ func pickExtension(mimeType, filename string) string {
 		}
 	}
 	if mimeType != "" {
-		exts, _ := mime.ExtensionsByType(mimeType)
-		if len(exts) > 0 {
-			return strings.ToLower(exts[0])
-		}
+		// Prefer canonical extensions before consulting the system mime DB.
+		// On Debian-based hosts mime.ExtensionsByType("image/jpeg") returns
+		// [".jfif", ".jpe", ".jpeg", ".jpg"] — and Apache's default mime.types
+		// has no mapping for .jfif, so the served file goes out with no
+		// Content-Type and browsers refuse to render it.
 		switch {
 		case strings.Contains(mimeType, "jpeg"):
 			return ".jpg"
 		case strings.Contains(mimeType, "png"):
 			return ".png"
+		case strings.Contains(mimeType, "webp"):
+			return ".webp"
+		case strings.Contains(mimeType, "gif"):
+			return ".gif"
 		case strings.Contains(mimeType, "pdf"):
 			return ".pdf"
 		case strings.Contains(mimeType, "mp4"):
 			return ".mp4"
 		case strings.Contains(mimeType, "ogg"):
 			return ".ogg"
+		}
+		exts, _ := mime.ExtensionsByType(mimeType)
+		if len(exts) > 0 {
+			return strings.ToLower(exts[0])
 		}
 	}
 	return ".bin"
