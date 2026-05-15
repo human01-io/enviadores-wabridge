@@ -6,6 +6,7 @@
 //   wabridge install         # install as a Windows service
 //   wabridge uninstall       # remove the service
 //   wabridge start | stop    # service control
+//   wabridge version         # print the build tag baked in by CI
 //
 // Configuration is read from ./config.yaml relative to the binary.
 package main
@@ -28,9 +29,21 @@ import (
 	"github.com/kardianos/service"
 )
 
+// version is overridden at build time by CI with -ldflags
+// "-X main.version=<git-tag>". An unstamped local build (go build ./...)
+// keeps the "dev" sentinel so the version subcommand still works.
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "", "path to config.yaml (default: <exe dir>/config.yaml)")
 	flag.Parse()
+
+	// "version" is a config-free subcommand — report what's in the binary
+	// without needing a tunnel target or even a config file to exist.
+	if flag.Arg(0) == "version" {
+		fmt.Println(version)
+		return
+	}
 
 	cfgPath := *configPath
 	if cfgPath == "" {

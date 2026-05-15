@@ -31,13 +31,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build wabridge.exe
-        shell: pwsh
-        run: |
-          go build -trimpath -ldflags="-s -w" -o wabridge.exe ./cmd/wabridge
-          if (-not (Test-Path wabridge.exe)) { throw "Build did not produce wabridge.exe" }
-          Get-Item wabridge.exe | Select-Object Name, Length, LastWriteTime
-
       - name: Bump tag
         id: tag
         uses: mathieudutour/github-tag-action@v6.2
@@ -47,6 +40,18 @@ jobs:
           # if/when we wire those up. For now every main push = patch bump.
           default_bump: patch
           tag_prefix: v
+
+      - name: Build wabridge.exe
+        shell: pwsh
+        env:
+          # Stamp the new tag into main.version so `wabridge.exe version`
+          # reports the same string GitHub Releases shows.
+          BUILD_TAG: ${{ steps.tag.outputs.new_tag }}
+        run: |
+          go build -trimpath -ldflags="-s -w -X main.version=$env:BUILD_TAG" -o wabridge.exe ./cmd/wabridge
+          if (-not (Test-Path wabridge.exe)) { throw "Build did not produce wabridge.exe" }
+          Get-Item wabridge.exe | Select-Object Name, Length, LastWriteTime
+          .\wabridge.exe version
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
