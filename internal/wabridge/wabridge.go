@@ -380,6 +380,18 @@ func (b *Bridge) resolveDisplayNameForJID(ctx context.Context, jid types.JID, co
 }
 
 func (b *Bridge) handleMessage(evt *events.Message) {
+	// Skip status@broadcast (WhatsApp "Status" / Stories from contacts).
+	// They aren't user-actionable for a business inbox, and processing
+	// them was choking the queue — bursts of contacts posting Status
+	// would each call UpsertChat on the broadcast row over the slow
+	// SSH-tunneled MySQL link, hit the 60s context deadline, and stall
+	// real inbound behind them. Filtering at the top is the cheapest
+	// fix and lets the React UI carry on as before (it never showed
+	// status@broadcast anyway).
+	if evt.Info.Chat.Server == types.BroadcastServer && evt.Info.Chat.User == "status" {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
