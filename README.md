@@ -18,7 +18,7 @@ replies, just captures inbound chats and media.
 3. Connects to **WhatsApp** via [whatsmeow](https://github.com/tulir/whatsmeow).
    First run prints a QR code — scan it from WhatsApp → Linked Devices.
 4. On every inbound message: upserts `wa_chats`, downloads any media,
-   **SFTPs it to** `/home/cxcc76i48ff4/public_html/wa_media/<sha256>.<ext>`,
+   **SFTPs it to** `<remote_path>/<sha256>.<ext>` on the shared host,
    and inserts a `wa_messages` row.
 
 The React app at `/whatsapp` polls the PHP gateway every ~7s for new messages
@@ -27,20 +27,19 @@ on the active chat, so latency end-to-end is single-digit seconds.
 ## Prerequisites
 
 - Go 1.22+ on Windows
-- An SSH key pair authorized on the shared host. If `ssh enviadores ls` works
-  from the office machine, you're set.
-- A MySQL user on `env_producto` with `SELECT, INSERT, UPDATE` privileges.
-  On this shared cPanel host the `alex` admin account cannot run
-  `CREATE USER` directly — use the cPanel UAPI from SSH instead:
+- An SSH key pair authorized on the shared host. If `ssh <your-host> ls`
+  works from the office machine, you're set.
+- A MySQL user with `SELECT, INSERT, UPDATE` privileges on the target
+  database. On shared cPanel hosts the admin user can't always run
+  `CREATE USER` directly; if so, use the cPanel UAPI from SSH instead:
   ```bash
-  ssh enviadores "uapi Mysql create_user name=wabridge password='<STRONG_PASSWORD>'"
-  ssh enviadores "uapi Mysql set_privileges_on_database user=wabridge \
-      database=env_producto privileges='SELECT,INSERT,UPDATE'"
+  ssh <host> "uapi Mysql create_user name=wabridge password='<STRONG_PASSWORD>'"
+  ssh <host> "uapi Mysql set_privileges_on_database user=wabridge \
+      database=<your_database> privileges='SELECT,INSERT,UPDATE'"
   ```
-  The resulting account is `wabridge@localhost` (no cPanel prefix on this
-  host) with database-wide SELECT/INSERT/UPDATE on `env_producto`. The bridge
-  only touches `wa_chats` and `wa_messages`, but per-table grants require
-  privileges this account doesn't have.
+  The bridge only touches `wa_chats` and `wa_messages`, but per-table grants
+  require privileges some shared hosts don't expose, so database-wide
+  SELECT/INSERT/UPDATE is the path of least resistance.
 - The PHP gateway needs `wa_media/` to be web-readable. By default Apache
   serves anything under `public_html/` — no extra config required. URLs are
   unguessable SHA-256 hashes, but if you want to harden, add `.htaccess` to

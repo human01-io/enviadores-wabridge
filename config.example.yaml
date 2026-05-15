@@ -4,14 +4,15 @@
 # Never commit the real config.yaml — see .gitignore.
 
 ssh:
-  # SSH endpoint of the shared host (same as your `enviadores` alias)
-  host: enviadores.com.mx
+  # SSH endpoint of the shared host. Use the origin IP if the domain is
+  # fronted by a proxy that doesn't pass SSH through (e.g. Cloudflare).
+  host: your-host.example.com
   port: 22
-  user: cxcc76i48ff4
+  user: your-shell-user
   # Path to a private key with passwordless access. "~" is expanded to the
   # current user's home directory on macOS, Linux, and Windows.
   #   macOS / Linux: ~/.ssh/id_ed25519
-  #   Windows      : ~/.ssh/id_ed25519        (or C:\Users\Operador\.ssh\id_ed25519)
+  #   Windows      : ~/.ssh/id_ed25519        (or C:\Users\<you>\.ssh\id_ed25519)
   private_key_path: ~/.ssh/id_ed25519
   # Optional. If set, used to decrypt the key.
   private_key_passphrase: ""
@@ -19,19 +20,20 @@ ssh:
   # ~/.ssh/known_hosts works everywhere.
   known_hosts_path: ""
 
-# MySQL connection — accessed via the SSH tunnel as localhost:remote_port → enviadores:3306.
+# MySQL connection — accessed via the SSH tunnel as localhost:remote_port → host:3306.
 mysql:
   user: wabridge
-  password: "REDACTED"
-  database: env_producto
+  password: "REPLACE_ME"
+  database: your_database
   # Local port that wabridge binds for the SSH tunnel; pick something free.
   local_tunnel_port: 53306
 
 # Where wabridge SFTPs incoming WhatsApp media on the shared host. The PHP
-# gateway exposes it as https://enviadores.com.mx/wa_media/<sha256>.<ext>.
+# gateway exposes the directory at public_base_url so the React app can
+# fetch files via plain HTTPS using the sha256-derived basename.
 media:
-  remote_path: /home/cxcc76i48ff4/public_html/wa_media
-  public_base_url: https://enviadores.com.mx/wa_media
+  remote_path: /home/your-shell-user/public_html/wa_media
+  public_base_url: https://your-domain.example.com/wa_media
 
 # whatsmeow device session — local SQLite. Path is relative to working dir.
 whatsmeow:
@@ -39,8 +41,8 @@ whatsmeow:
   # Verbose protocol logs only matter while debugging pairing.
   log_level: INFO
 
-# How wabridge identifies itself in logs.
+# How wabridge identifies itself in logs and to the OS service manager.
 service:
   name: enviadores-wabridge
   display_name: Enviadores WhatsApp Bridge
-  description: Mirrors WhatsApp messages for PDV0000001 into env_producto
+  description: WhatsApp bridge for the business inbox
