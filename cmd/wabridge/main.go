@@ -160,6 +160,13 @@ func supervise(ctx context.Context, cfg *config.Config) {
 }
 
 func runOnce(ctx context.Context, cfg *config.Config) error {
+	// Scope every watcher goroutine below to this attempt. When runOnce
+	// returns (a tunnel/whatsmeow drop), cancel() stops them all instead of
+	// leaking them onto the long-lived supervise ctx — otherwise each retry
+	// piles up more watchers that hot-loop on the now-closed DB.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	tun := tunnel.New(cfg)
 	if err := tun.Open(); err != nil {
 		return fmt.Errorf("open tunnel: %w", err)
