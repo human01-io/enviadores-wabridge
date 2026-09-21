@@ -176,8 +176,23 @@ If any of those become important, they're small additions to `internal/wabridge`
 
 ## Pinning whatsmeow
 
-`go.mod` lists `whatsmeow v0.0.0-...` as a placeholder; `go mod tidy` will
-resolve to the current main. The library's API does change occasionally — if
-a `go build` errors with method signature changes, check the
-[whatsmeow changelog](https://github.com/tulir/whatsmeow/commits/main) and
-update the small set of call sites in `internal/wabridge/wabridge.go`.
+whatsmeow comes from the fork `human01-io/whatsmeow-fork` through a `replace`
+in `go.mod`. The fork's `bizwrapper-fix` branch is upstream `tulir/whatsmeow`
+plus one patch that skips the `<biz>` wrapper for
+`InteractiveResponseMessage` (without it WhatsApp rejects Meta Flow
+responses). celeste pins the same fork, so bump both together.
+
+To pull in upstream fixes:
+
+```bash
+cd whatsmeow-fork
+git fetch origin && git checkout bizwrapper-fix && git rebase origin/main
+go build ./... && git push --force-with-lease fork bizwrapper-fix
+cd ../enviadores-wabridge
+GOPROXY=direct go mod edit -replace go.mau.fi/whatsmeow=github.com/human01-io/whatsmeow-fork@<new-sha>
+GOPROXY=direct go mod tidy && go build ./... && go test ./...
+```
+
+Upstream sometimes raises the minimum Go version, so let `go mod tidy` move
+the `go` directive; CI reads it via `go-version-file`. If `go build` breaks on
+API changes, the call sites are in `internal/wabridge/wabridge.go`.
