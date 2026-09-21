@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/enviadores/wabridge/internal/config"
+	"github.com/enviadores/wabridge/internal/logfile"
 	"github.com/enviadores/wabridge/internal/media"
 	"github.com/enviadores/wabridge/internal/store"
 	"github.com/enviadores/wabridge/internal/tunnel"
@@ -76,7 +77,9 @@ func main() {
 		cmd := flag.Arg(0)
 		if cmd == "run" {
 			// Foreground execution — bypasses kardianos so logs go straight to stdout
-			// and the QR-code pairing flow is visible.
+			// and the QR-code pairing flow is visible (and are teed to the log file).
+			closeLog := startLogging(cfgPath, cfg, true)
+			defer closeLog()
 			runForeground(cfg)
 			return
 		}
@@ -88,10 +91,28 @@ func main() {
 	}
 
 	// Invoked with no args: assume we're being launched by the Windows
-	// service manager.
+	// service manager. Its stdout is discarded, so the log file is the only
+	// record of why a session dropped.
+	closeLog := startLogging(cfgPath, cfg, false)
+	defer closeLog()
 	if err := svc.Run(); err != nil {
 		log.Fatalf("service run: %v", err)
 	}
+}
+
+// startLogging sends all output to wabridge.log next to config.yaml. A
+// failure to open it is logged and ignored — the bridge still runs.
+func startLogging(cfgPath string, cfg *config.Config, tee bool) func() {
+	closeLog, err := logfile.Setup(filepath.Join(filepath.Dir(cfgPath), logfile.FileName), tee)
+	if err != nil {
+		log.Printf("wabridge: log file unavailable: %v", err)
+		closeLog = func() {}
+	}
+	log.Printf("wabridge %s starting — whatsmeow store: %s", version, cfg.Whatsmeow.StorePath)
+	if cfg.Whatsmeow.LegacyStorePath {
+		log.Printf("wabridge: using legacy store path relative to the working directory; move it next to the binary to silence this")
+	}
+	return closeLog
 }
 
 type program struct {
@@ -141,9 +162,15 @@ func supervise(ctx context.Context, cfg *config.Config) {
 			return
 		}
 
+		started := time.Now()
 		err := runOnce(ctx, cfg)
 		if ctx.Err() != nil {
 			return
+		}
+		// An attempt that ran a while was healthy (or cycling QR batches);
+		// don't make the next one wait out an old backoff.
+		if time.Since(started) > 2*time.Minute {
+			backoff = 2 * time.Second
 		}
 		log.Printf("wabridge: lost connection: %v — reconnect in %s", err, backoff)
 

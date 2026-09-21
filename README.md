@@ -151,6 +151,15 @@ If any of those become important, they're small additions to `internal/wabridge`
 
 ## Troubleshooting
 
+- **Logs.** Both `wabridge run` and the service write to `wabridge.log`
+  next to `config.yaml` (rotated to `wabridge.log.1` at 10 MB). Under the
+  Windows service this is the only place output goes.
+- **The page asks for a QR again (session dropped).** The reason is kept in
+  `wa_pairing.last_event` as `session lost: … @ <UTC time>` until the next
+  successful pairing — visible via `GET /v2/whatsapp/pairing`. "Logged out
+  by WhatsApp (stream error…)" usually means the device was removed on the
+  phone; a connect-time code or "client outdated" points at WhatsApp
+  rejecting the client — bump the whatsmeow pin.
 - **QR code never appears.** Check `whatsmeow.db` permissions and delete it
   if corrupted. Re-pair.
 - **`open tunnel: ssh dial: ...`** — make sure `ssh enviadores echo ok`
