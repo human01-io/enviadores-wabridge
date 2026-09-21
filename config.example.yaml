@@ -35,7 +35,8 @@ media:
   remote_path: /home/your-shell-user/public_html/wa_media
   public_base_url: https://your-domain.example.com/wa_media
 
-# whatsmeow device session — local SQLite. Path is relative to working dir.
+# whatsmeow device session — local SQLite. A relative path is resolved next to
+# config.yaml (not the working dir, which is System32 for the Windows service).
 whatsmeow:
   store_path: whatsmeow.db
   # Verbose protocol logs only matter while debugging pairing.

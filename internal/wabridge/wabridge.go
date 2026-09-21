@@ -109,10 +109,17 @@ func (b *Bridge) runQRLoop(ctx context.Context, qrChan <-chan whatsmeow.QRChanne
 				}
 			}
 		case "timeout":
-			b.logger.Warnf("QR pairing timed out — restart wabridge or click 'Reset' in the web UI")
+			// whatsmeow disconnects after its batch of codes runs out. Restart
+			// right away for a fresh batch; otherwise the page shows an
+			// expired code until the 5-minute disconnect watchdog fires.
+			b.logger.Warnf("QR pairing timed out — restarting for a fresh QR batch")
 			_ = b.pairing.SetEvent(ctx, pairing.StatusError, "qr timeout")
+			b.signalFatal(fmt.Errorf("qr timeout"))
 		default:
+			// err-* events end the QR flow just like a timeout.
+			b.logger.Errorf("QR pairing failed: %s — restarting", evt.Event)
 			_ = b.pairing.SetEvent(ctx, pairing.StatusError, "qr event: "+evt.Event)
+			b.signalFatal(fmt.Errorf("qr event: %s", evt.Event))
 		}
 	}
 }
@@ -138,6 +145,7 @@ func (b *Bridge) WatchResetRequests(ctx context.Context) error {
 				continue
 			}
 			b.logger.Infof("Reset requested from web UI — logging out current session")
+			b.recordSessionLost("reset requested from the web UI")
 			if err := b.client.Logout(ctx); err != nil {
 				b.logger.Warnf("Logout: %v", err)
 			}
@@ -183,8 +191,25 @@ func (b *Bridge) handleEvent(evt interface{}) {
 		// removed the device, security flag, etc.). whatsmeow has
 		// already cleared the local device store; bounce supervise()
 		// so the next runOnce() starts a fresh QR flow.
-		b.logger.Errorf("Logged out: %s — triggering bridge restart", v.Reason)
-		b.signalFatal(fmt.Errorf("logged out: %s", v.Reason))
+		reason := loggedOutReason(v)
+		b.logger.Errorf("Logged out: %s — triggering bridge restart", reason)
+		b.recordSessionLost("logged out by WhatsApp (" + reason + ")")
+		b.signalFatal(fmt.Errorf("logged out: %s", reason))
+	case *events.StreamReplaced:
+		// Another client connected with our keys (e.g. a second copy of
+		// wabridge using the same whatsmeow.db). The session survives, but
+		// whatsmeow won't reconnect on its own.
+		b.logger.Errorf("Stream replaced — another client is using this session")
+	case *events.TemporaryBan:
+		b.logger.Errorf("Temporary ban: %s", v.String())
+		b.recordSessionLost("temporary ban: " + v.String())
+	case *events.ClientOutdated:
+		b.logger.Errorf("WhatsApp rejected the client as outdated — update whatsmeow and release a new wabridge")
+		b.recordSessionLost("client outdated: update whatsmeow")
+	case *events.ConnectFailure:
+		// Usually transient (whatsmeow retries); log-only so a recovered
+		// connection doesn't leave the web UI stuck on an error.
+		b.logger.Errorf("Connect failure: %s %s", v.Reason, v.Message)
 	case *events.Receipt:
 		b.handleReceipt(v)
 	case *events.Message:
@@ -193,6 +218,26 @@ func (b *Bridge) handleEvent(evt interface{}) {
 		// History sync can carry thousands of messages; offload to a
 		// goroutine so we don't block subsequent live events.
 		go b.handleHistorySync(v)
+	}
+}
+
+// loggedOutReason turns a LoggedOut event into readable text. Reason codes
+// only come with connect-time failures; otherwise it was a stream:error
+// (typically the device being removed from the phone).
+func loggedOutReason(v *events.LoggedOut) string {
+	if v.OnConnect {
+		return fmt.Sprintf("%s, code %d", v.Reason, int(v.Reason))
+	}
+	return "stream error, usually the device was removed on the phone"
+}
+
+// recordSessionLost persists why the linked device went away into
+// wa_pairing so it survives the QR loop that follows.
+func (b *Bridge) recordSessionLost(reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.pairing.SetSessionLost(ctx, reason); err != nil {
+		b.logger.Warnf("pairing.SetSessionLost: %v", err)
 	}
 }
 

@@ -44,7 +44,7 @@ func (w *Writer) SetQRCode(ctx context.Context, code string, validFor time.Durat
 		SET status = 'awaiting_scan',
 		    qr_code = ?,
 		    qr_expires_at = ?,
-		    last_event = 'qr emitted'
+		    last_event = `+keepSessionLost("'qr emitted'")+`
 		WHERE id = 1
 	`, code, expires)
 	return err
@@ -70,9 +70,36 @@ func (w *Writer) SetEvent(ctx context.Context, status Status, msg string) error 
 	_, err := w.db.ExecContext(ctx, `
 		UPDATE wa_pairing
 		SET status = ?,
-		    last_event = ?
+		    last_event = `+keepSessionLost("?")+`
 		WHERE id = 1
 	`, string(status), msg)
+	return err
+}
+
+// sessionLostPrefix marks a last_event recording why the linked device went
+// away. The QR loop that follows would otherwise overwrite it within
+// seconds; SetQRCode and SetEvent keep it until the next SetPaired, so the
+// reason stays visible (web UI, GET /v2/whatsapp/pairing) until someone
+// re-links.
+const sessionLostPrefix = "session lost: "
+
+func keepSessionLost(newValue string) string {
+	return "IF(last_event LIKE '" + sessionLostPrefix + "%', last_event, " + newValue + ")"
+}
+
+// SetSessionLost records that the WhatsApp session is gone and why, stamped
+// with the UTC time it happened.
+func (w *Writer) SetSessionLost(ctx context.Context, reason string) error {
+	if len(reason) > 180 { // last_event is VARCHAR(255)
+		reason = reason[:180]
+	}
+	msg := sessionLostPrefix + reason + " @ " + time.Now().UTC().Format("2006-01-02 15:04 UTC")
+	_, err := w.db.ExecContext(ctx, `
+		UPDATE wa_pairing
+		SET status = ?,
+		    last_event = ?
+		WHERE id = 1
+	`, string(StatusError), msg)
 	return err
 }
 
