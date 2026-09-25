@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net/url"
 	"path"
 	"strings"
 	"sync"
@@ -133,16 +134,58 @@ func (u *Uploader) Read(basename string) ([]byte, error) {
 	return data, nil
 }
 
-// BasenameFromPublicURL returns the trailing file segment of a URL that
-// was previously produced by Upload or by the PHP gateway — both share
-// the configured PublicBaseURL prefix. Empty string if the URL doesn't
-// belong to this uploader's public base.
+// BasenameFromPublicURL returns the trailing file segment of a URL that was
+// previously produced by Upload or by the PHP gateway — both serve the same
+// directory under the configured PublicBaseURL's path. Empty string if the
+// URL doesn't look like one of ours.
+//
+// Only the *path* is matched, never the host: the gateway moved wa_media from
+// the apex to api.enviadores.com.mx on 2026-06-25 while this bridge still had
+// the apex in public_base_url, and every outbound attachment failed with
+// "media_url outside public base" from then until 2026-09-25. The React app
+// matches on the path alone for the same reason; the host is deployment
+// trivia, the path is the contract.
 func (u *Uploader) BasenameFromPublicURL(publicURL string) string {
-	prefix := strings.TrimRight(u.cfg.Media.PublicBaseURL, "/") + "/"
-	if !strings.HasPrefix(publicURL, prefix) {
+	prefix := strings.TrimRight(publicBasePath(u.cfg.Media.PublicBaseURL), "/") + "/"
+
+	p := publicURL
+	if parsed, err := url.Parse(publicURL); err == nil && parsed.Path != "" {
+		p = parsed.Path
+	}
+	if !strings.HasPrefix(p, prefix) {
 		return ""
 	}
-	return strings.TrimPrefix(publicURL, prefix)
+	name := strings.TrimPrefix(p, prefix)
+	if decoded, err := url.PathUnescape(name); err == nil {
+		name = decoded
+	}
+	// The result is joined onto the remote media dir and opened over SFTP, so
+	// anything that could escape that directory is rejected outright.
+	if name == "" || name == "." || name == ".." ||
+		strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return ""
+	}
+	return name
+}
+
+// publicBasePath reduces a configured public base URL to its path, so a
+// same-path URL on any host still resolves. A bare path or a host-only value
+// (no scheme) is handled too, since config.yaml is hand-edited.
+func publicBasePath(base string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return "/"
+	}
+	if parsed, err := url.Parse(base); err == nil && parsed.Host != "" {
+		if parsed.Path == "" {
+			return "/"
+		}
+		return parsed.Path
+	}
+	if i := strings.Index(base, "/"); i >= 0 {
+		return base[i:]
+	}
+	return "/"
 }
 
 func (u *Uploader) ensureRemoteDir() error {
