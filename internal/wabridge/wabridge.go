@@ -6,6 +6,7 @@ package wabridge
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -1235,9 +1236,12 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	msg, msgType, thumbURL, sendErr := b.buildOutboundMessage(ctx, r)
 	if sendErr != nil {
 		// buildOutboundMessage marks permanent failures itself for bad
-		// configuration; anything that reaches here is transient (SFTP,
+		// configuration; re-marking them here would reset attempts and
+		// overwrite the real reason. Anything else is transient (SFTP,
 		// upload to WhatsApp CDN) and gets the normal backoff treatment.
-		b.markOutboundAttempt(ctx, r, sendErr.Error())
+		if !errors.Is(sendErr, errOutboundPermanent) {
+			b.markOutboundAttempt(ctx, r, sendErr.Error())
+		}
 		return
 	}
 
@@ -1329,17 +1333,18 @@ func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waPr
 	mediaType, ok := mediaTypeForKind(kind)
 	if !ok {
 		b.markOutboundPermanentlyFailed(ctx, r.ID, "unsupported kind: "+kind)
-		return nil, "", thumbURL, fmt.Errorf("unsupported kind %q (already marked failed)", kind)
+		return nil, "", thumbURL, fmt.Errorf("unsupported kind %q: %w", kind, errOutboundPermanent)
 	}
 	if !r.MediaURL.Valid || r.MediaURL.String == "" {
 		b.markOutboundPermanentlyFailed(ctx, r.ID, "media row missing media_url")
-		return nil, "", thumbURL, fmt.Errorf("media_url missing (already marked failed)")
+		return nil, "", thumbURL, fmt.Errorf("media row missing media_url: %w", errOutboundPermanent)
 	}
 
 	basename := b.uploader.BasenameFromPublicURL(r.MediaURL.String)
 	if basename == "" {
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "media_url not under configured public base")
-		return nil, "", thumbURL, fmt.Errorf("media_url outside public base (already marked failed)")
+		b.markOutboundPermanentlyFailed(ctx, r.ID,
+			"media_url path is not under public_base_url ("+b.cfg.Media.PublicBaseURL+"): "+r.MediaURL.String)
+		return nil, "", thumbURL, fmt.Errorf("media_url %q is not under the configured public base: %w", r.MediaURL.String, errOutboundPermanent)
 	}
 	data, err := b.uploader.Read(basename)
 	if err != nil {
@@ -1560,10 +1565,17 @@ func (b *Bridge) markOutboundAttempt(ctx context.Context, r outboundRow, msg str
 
 // markOutboundPermanentlyFailed terminates retries immediately. Use for
 // errors that won't fix themselves on the next try (bad JID, etc.).
+// errOutboundPermanent marks an outbound failure that markOutboundPermanentlyFailed
+// has already recorded, so the caller doesn't overwrite it with a retry attempt.
+var errOutboundPermanent = errors.New("outbound permanently failed")
+
 func (b *Bridge) markOutboundPermanentlyFailed(ctx context.Context, id int64, msg string) {
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
+	// Loud on purpose: a permanent failure means an attachment silently never
+	// reaches the customer, and the web UI never re-reads the row to notice.
+	b.logger.Errorf("Outbound %d permanently failed: %s", id, msg)
 	if _, err := b.store.DB().ExecContext(ctx, `
 		UPDATE wa_outbound
 		SET status = 'failed',
