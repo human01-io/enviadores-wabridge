@@ -12,6 +12,10 @@ name: Release
 on:
   push:
     branches: [main]
+    # Every release rolls out to the office machine and restarts the
+    # service, so docs-only pushes don't cut one.
+    paths-ignore:
+      - '**.md'
   workflow_dispatch:
 
 permissions:
