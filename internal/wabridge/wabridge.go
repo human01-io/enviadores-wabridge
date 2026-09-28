@@ -39,8 +39,11 @@ type Bridge struct {
 
 func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, error) {
 	level := strings.ToUpper(cfg.Whatsmeow.LogLevel)
-	dbLog := waLog.Stdout("wa-db", level, true)
-	clientLog := waLog.Stdout("wa-client", level, true)
+	// No ANSI colour: every line lands in wabridge.log (stdout is redirected
+	// into it, and the foreground `run` tee writes the same bytes to both),
+	// so colour codes only turn the file into "[36m [wa-client INFO] …".
+	dbLog := waLog.Stdout("wa-db", level, false)
+	clientLog := waLog.Stdout("wa-client", level, false)
 
 	container, err := sqlstore.New(ctx, "sqlite3",
 		fmt.Sprintf("file:%s?_foreign_keys=on", cfg.Whatsmeow.StorePath),
