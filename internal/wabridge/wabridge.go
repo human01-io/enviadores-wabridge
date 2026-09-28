@@ -100,7 +100,7 @@ func (b *Bridge) runQRLoop(ctx context.Context, qrChan <-chan whatsmeow.QRChanne
 	for evt := range qrChan {
 		switch evt.Event {
 		case "code":
-			b.logger.Infof("QR code emitted (valid ~20s) — visible at app.enviadores.com.mx/whatsapp")
+			b.logger.Infof("QR code emitted (valid ~20s) - visible at app.enviadores.com.mx/whatsapp")
 			b.logger.Infof("Terminal fallback: %s", evt.Code)
 			if err := b.pairing.SetQRCode(ctx, evt.Code, 20*time.Second); err != nil {
 				b.logger.Warnf("pairing.SetQRCode: %v", err)
@@ -116,12 +116,12 @@ func (b *Bridge) runQRLoop(ctx context.Context, qrChan <-chan whatsmeow.QRChanne
 			// whatsmeow disconnects after its batch of codes runs out. Restart
 			// right away for a fresh batch; otherwise the page shows an
 			// expired code until the 5-minute disconnect watchdog fires.
-			b.logger.Warnf("QR pairing timed out — restarting for a fresh QR batch")
+			b.logger.Warnf("QR pairing timed out - restarting for a fresh QR batch")
 			_ = b.pairing.SetEvent(ctx, pairing.StatusError, "qr timeout")
 			b.signalFatal(fmt.Errorf("qr timeout"))
 		default:
 			// err-* events end the QR flow just like a timeout.
-			b.logger.Errorf("QR pairing failed: %s — restarting", evt.Event)
+			b.logger.Errorf("QR pairing failed: %s - restarting", evt.Event)
 			_ = b.pairing.SetEvent(ctx, pairing.StatusError, "qr event: "+evt.Event)
 			b.signalFatal(fmt.Errorf("qr event: %s", evt.Event))
 		}
@@ -148,7 +148,7 @@ func (b *Bridge) WatchResetRequests(ctx context.Context) error {
 			if !reset {
 				continue
 			}
-			b.logger.Infof("Reset requested from web UI — logging out current session")
+			b.logger.Infof("Reset requested from web UI - logging out current session")
 			b.recordSessionLost("reset requested from the web UI")
 			if err := b.client.Logout(ctx); err != nil {
 				b.logger.Warnf("Logout: %v", err)
@@ -196,19 +196,19 @@ func (b *Bridge) handleEvent(evt interface{}) {
 		// already cleared the local device store; bounce supervise()
 		// so the next runOnce() starts a fresh QR flow.
 		reason := loggedOutReason(v)
-		b.logger.Errorf("Logged out: %s — triggering bridge restart", reason)
+		b.logger.Errorf("Logged out: %s - triggering bridge restart", reason)
 		b.recordSessionLost("logged out by WhatsApp (" + reason + ")")
 		b.signalFatal(fmt.Errorf("logged out: %s", reason))
 	case *events.StreamReplaced:
 		// Another client connected with our keys (e.g. a second copy of
 		// wabridge using the same whatsmeow.db). The session survives, but
 		// whatsmeow won't reconnect on its own.
-		b.logger.Errorf("Stream replaced — another client is using this session")
+		b.logger.Errorf("Stream replaced - another client is using this session")
 	case *events.TemporaryBan:
 		b.logger.Errorf("Temporary ban: %s", v.String())
 		b.recordSessionLost("temporary ban: " + v.String())
 	case *events.ClientOutdated:
-		b.logger.Errorf("WhatsApp rejected the client as outdated — update whatsmeow and release a new wabridge")
+		b.logger.Errorf("WhatsApp rejected the client as outdated - update whatsmeow and release a new wabridge")
 		b.recordSessionLost("client outdated: update whatsmeow")
 	case *events.ConnectFailure:
 		// Usually transient (whatsmeow retries); log-only so a recovered
@@ -282,7 +282,7 @@ func (b *Bridge) WatchConnection(ctx context.Context) error {
 				continue
 			}
 			if time.Since(disconnectedSince) >= disconnectThreshold {
-				return fmt.Errorf("disconnected for >%s — restarting", disconnectThreshold)
+				return fmt.Errorf("disconnected for >%s - restarting", disconnectThreshold)
 			}
 		}
 	}
@@ -1311,7 +1311,7 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		b.logger.Warnf("Outbound UpsertChat %s: %v", storeChatJID, err)
 	}
 
-	b.logger.Infof("Sent outbound %d (%s, %s) → %s", r.ID, resp.ID, msgType, storeChatJID)
+	b.logger.Infof("Sent outbound %d (%s, %s) -> %s", r.ID, resp.ID, msgType, storeChatJID)
 }
 
 // buildOutboundMessage materialises the proto message to send for a row,
@@ -1563,7 +1563,7 @@ func (b *Bridge) markOutboundAttempt(ctx context.Context, r outboundRow, msg str
 		b.logger.Warnf("Failed to bump attempts on outbound %d: %v", r.ID, err)
 		return
 	}
-	b.logger.Infof("Outbound %d attempt %d/%d failed: %s — will retry", r.ID, nextAttempts, outboundMaxAttempts, msg)
+	b.logger.Infof("Outbound %d attempt %d/%d failed: %s - will retry", r.ID, nextAttempts, outboundMaxAttempts, msg)
 }
 
 // markOutboundPermanentlyFailed terminates retries immediately. Use for
