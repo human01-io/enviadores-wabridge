@@ -108,7 +108,7 @@ func startLogging(cfgPath string, cfg *config.Config, tee bool) func() {
 		log.Printf("wabridge: log file unavailable: %v", err)
 		closeLog = func() {}
 	}
-	log.Printf("wabridge %s starting — whatsmeow store: %s", version, cfg.Whatsmeow.StorePath)
+	log.Printf("wabridge %s starting - whatsmeow store: %s", version, cfg.Whatsmeow.StorePath)
 	if cfg.Whatsmeow.LegacyStorePath {
 		log.Printf("wabridge: using legacy store path relative to the working directory; move it next to the binary to silence this")
 	}
@@ -172,7 +172,7 @@ func supervise(ctx context.Context, cfg *config.Config) {
 		if time.Since(started) > 2*time.Minute {
 			backoff = 2 * time.Second
 		}
-		log.Printf("wabridge: lost connection: %v — reconnect in %s", err, backoff)
+		log.Printf("wabridge: lost connection: %v - reconnect in %s", err, backoff)
 
 		select {
 		case <-ctx.Done():
