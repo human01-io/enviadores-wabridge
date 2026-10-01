@@ -29,17 +29,24 @@ on the active chat, so latency end-to-end is single-digit seconds.
 - Go 1.22+ on Windows
 - An SSH key pair authorized on the shared host. If `ssh <your-host> ls`
   works from the office machine, you're set.
-- A MySQL user with `SELECT, INSERT, UPDATE` privileges on the target
-  database. On shared cPanel hosts the admin user can't always run
-  `CREATE USER` directly; if so, use the cPanel UAPI from SSH instead:
-  ```bash
-  ssh <host> "uapi Mysql create_user name=wabridge password='<STRONG_PASSWORD>'"
-  ssh <host> "uapi Mysql set_privileges_on_database user=wabridge \
-      database=<your_database> privileges='SELECT,INSERT,UPDATE'"
+- A MySQL user that can read and write **only the bridge's own tables**:
+  `wa_chats`, `wa_messages`, `wa_outbound`, `wa_pairing` and
+  `wa_typing_outbound` (`SELECT, INSERT, UPDATE`; the bridge never deletes).
+  Its password lives in `config.yaml` on the office machine, so do not give it
+  database-wide access: a lost or compromised office PC would then expose every
+  customer, password hash and ledger row. On a box where you control MySQL:
+  ```sql
+  CREATE USER 'wabridge'@'localhost' IDENTIFIED BY '<STRONG_PASSWORD>';
+  GRANT SELECT, INSERT, UPDATE ON <db>.wa_chats           TO 'wabridge'@'localhost';
+  GRANT SELECT, INSERT, UPDATE ON <db>.wa_messages        TO 'wabridge'@'localhost';
+  GRANT SELECT, INSERT, UPDATE ON <db>.wa_outbound        TO 'wabridge'@'localhost';
+  GRANT SELECT, INSERT, UPDATE ON <db>.wa_pairing         TO 'wabridge'@'localhost';
+  GRANT SELECT, INSERT, UPDATE ON <db>.wa_typing_outbound TO 'wabridge'@'localhost';
   ```
-  The bridge only touches `wa_chats` and `wa_messages`, but per-table grants
-  require privileges some shared hosts don't expose, so database-wide
-  SELECT/INSERT/UPDATE is the path of least resistance.
+  Production (Enviadores, Vultr) runs exactly these grants since 2026-10-01.
+  When a new release touches another table, add that table's grant before
+  deploying it. A host that can't do per-table grants (some shared cPanel
+  plans) is not a supported target.
 - The PHP gateway needs `wa_media/` to be web-readable. By default Apache
   serves anything under `public_html/` — no extra config required. URLs are
   unguessable SHA-256 hashes, but if you want to harden, add `.htaccess` to
