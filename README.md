@@ -51,6 +51,9 @@ on the active chat, so latency end-to-end is single-digit seconds.
   `wa_quick_replies` are written by the PHP API only, so the bridge user must
   not get them. The bridge still never issues a `DELETE`: removing a reaction
   flips its row to `message_type='system'` instead.
+  v0.3.0 (new chats by phone) also needs **no new grant**: it reads and
+  updates `wa_outbound` and `wa_pairing` only. `customer_contacts` (the
+  retention contact log) is PHP-only; never grant it to the bridge user.
   When a new release touches another table, add that table's grant before
   deploying it. A host that can't do per-table grants (some shared cPanel
   plans) is not a supported target.
@@ -134,11 +137,62 @@ with the old statements.
   read up to the newest message the receipt names; inbound messages newer
   than that stay unread.
 - **Heartbeat**: `wa_pairing.last_seen_at` is stamped on connect and every
-  30 s while connected.
+  30 s while connected (UTC).
 
 Tests: `go test ./...` (SQL paths run against `internal/testdb`, an in-memory
 driver that records statements; no MySQL needed). Production is Windows, so
 also check `GOOS=windows go build ./...`.
+
+## New chats by phone (v0.3.0)
+
+The web inbox can write to a customer who never wrote to the office number
+(from "Clientes frecuentes"). It needs the `2026_10_18_retention_whatsapp_inbox`
+migration (`wa_outbound.to_phone/to_name/error_code`, status `resolve`,
+`wa_pairing.bridge_features/bridge_features_at`). Without it the feature stays
+off (one log line) and everything else works as before.
+
+- **Queue**: the PHP API writes `status='resolve'`, `chat_jid=NULL`,
+  `to_phone='+52XXXXXXXXXX'`, `to_name`, `kind='text'`. The existing-chat poll
+  still selects only `status='pending'`, so older bridges never see these rows.
+- **Order**: validate `to_phone` (`+52` and 10 digits, else `INVALID_PHONE`) ->
+  `IsOnWhatsApp` (it returns the canonical JID, normally `@lid`, and caches
+  the LID mapping; a PN answer is canonicalized like every chat) -> store the
+  WhatsApp message ID on the row -> send the text with that ID -> stamp
+  `wa_outbound` `sent` -> `wa_chats` upsert -> `wa_messages` row -> set the
+  row's `chat_jid`. A number without WhatsApp fails with `NOT_ON_WHATSAPP`
+  and writes no chat or message: a chat row exists only after a send to a
+  JID WhatsApp confirmed. An existing chat row for that JID (the customer
+  wrote meanwhile) is updated, not duplicated.
+- **Retries**: a lookup or send error keeps the row in `resolve` with the
+  normal backoff; at the cap it fails with `LOOKUP_FAILED` / `SEND_FAILED`.
+  A message goes out at most once: a stamp that fails is retried in memory
+  (writes only, no send), and a bridge that restarted before the stamp sends
+  again with the ID stored on the row, which the recipient drops as a
+  duplicate. If the chat row cannot be written `chat_jid` stays NULL; the
+  customer's reply creates the chat.
+- **Expiry**: a `resolve` row older than 23 h fails with `EXPIRED` and is
+  never sent. The web app counts a row older than 24 h as undelivered and
+  lets staff write again, so a late send would make two cold messages (for
+  example after the bridge was down over a weekend).
+- **Pacing**: at most one new-chat lookup every 20 s. Existing-chat sends are
+  not paced.
+- **error_code**: every permanent failure writes `wa_outbound.error_code`
+  (`NOT_ON_WHATSAPP`, `INVALID_PHONE`, `SEND_FAILED`, `LOOKUP_FAILED`,
+  `EXPIRED`, `UNSUPPORTED_KIND`, `INVALID_JID`, `MEDIA`, `REACTION_TARGET`), and
+  `error_message` always starts with `<CODE>: `.
+- **Readiness**: every heartbeat also writes `bridge_features='new_chat'` and
+  `bridge_features_at`. The PHP API queues new chats only while those are
+  fresh, so rolling the bridge back switches the feature off by itself.
+
+**`wabridge check-number +525512345678`** asks WhatsApp whether a phone has
+an account and prints `is_in`, `jid`, `phone_number`, `verified_name` and the
+`store_jid` a new chat would use. It sends nothing and writes nothing to
+MySQL. It runs inside the running bridge (service or `wabridge run`): the
+command drops `check-number.req` next to `config.yaml` and waits up to 60 s
+for `check-number.res`. It does not open a second WhatsApp connection,
+because that would replace the service's session and swallow the messages
+that arrive meanwhile. Try both `+52` and `+521` forms on a staff number:
+they should give the same `store_jid`.
 
 ## First run (QR pairing)
 

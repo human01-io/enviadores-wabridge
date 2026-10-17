@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/enviadores/wabridge/internal/testdb"
 	"github.com/go-sql-driver/mysql"
@@ -412,22 +413,150 @@ func TestHeartbeatToleratesMissingColumn(t *testing.T) {
 			t.Fatalf("Heartbeat must not fail without the column: %v", err)
 		}
 	}
-	if n := len(db.Calls()); n != 1 {
+	// First call: the features statement, then the legacy one. Both columns
+	// are now known missing, so later calls run nothing.
+	if n := len(db.Calls()); n != 2 {
 		t.Fatalf("after the first failure no more statements should run, got %d", n)
 	}
-	if len(*logs) != 1 {
-		t.Fatalf("log once, got %v", *logs)
+	if len(*logs) != 2 {
+		t.Fatalf("log once per feature, got %v", *logs)
 	}
 	assertASCII(t, *logs)
 }
 
-func TestHeartbeatWritesLastSeenAt(t *testing.T) {
+func TestHeartbeatWritesFeatures(t *testing.T) {
 	st, db, _ := newStore(nil)
 	if err := st.Heartbeat(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if c := db.Calls()[0]; !has(c, "UPDATE wa_pairing SET last_seen_at = NOW() WHERE id = 1") {
+	cs := db.Calls()
+	if len(cs) != 1 {
+		t.Fatalf("one UPDATE expected: %+v", cs)
+	}
+	c := cs[0]
+	if !has(c, "UPDATE wa_pairing SET last_seen_at = UTC_TIMESTAMP(), bridge_features = ?, bridge_features_at = UTC_TIMESTAMP() WHERE id = 1") {
 		t.Fatalf("unexpected heartbeat %s", c.Query)
+	}
+	if len(c.Args) != 1 || c.Args[0] != BridgeFeatures || !strings.Contains(BridgeFeatures, "new_chat") {
+		t.Fatalf("features arg %v", c.Args)
+	}
+}
+
+func TestHeartbeatFeaturesFallback(t *testing.T) {
+	st, db, logs := newStore(func(c testdb.Call) testdb.Result {
+		if has(c, "bridge_features") {
+			return testdb.Result{Err: errBadField}
+		}
+		return testdb.Result{}
+	})
+	for i := 0; i < 2; i++ {
+		if err := st.Heartbeat(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs := db.Calls()
+	// 1st: features (fails) + legacy. 2nd: legacy only.
+	if len(cs) != 3 {
+		t.Fatalf("statements: %+v", cs)
+	}
+	for _, c := range cs[1:] {
+		if c.Query != "UPDATE wa_pairing SET last_seen_at = UTC_TIMESTAMP() WHERE id = 1" {
+			t.Fatalf("legacy heartbeat expected, got %s", c.Query)
+		}
+	}
+	if len(*logs) != 1 {
+		t.Fatalf("one log line: %v", *logs)
+	}
+}
+
+func TestPermanentFailWritesErrorCode(t *testing.T) {
+	st, db, _ := newStore(nil)
+	if err := st.FailOutbound(t.Context(), 7, 5, "NOT_ON_WHATSAPP", "number is not on WhatsApp"); err != nil {
+		t.Fatal(err)
+	}
+	c := db.Calls()[0]
+	if !has(c, "status = 'failed'", "error_code = ?") {
+		t.Fatalf("unexpected %s", c.Query)
+	}
+	if c.Args[0] != int64(5) || c.Args[1] != "NOT_ON_WHATSAPP: number is not on WhatsApp" || c.Args[2] != "NOT_ON_WHATSAPP" || c.Args[3] != int64(7) {
+		t.Fatalf("args %v", c.Args)
+	}
+}
+
+func TestPermanentFailLegacyFallbackKeepsCodeInMessage(t *testing.T) {
+	st, db, logs := newStore(func(c testdb.Call) testdb.Result {
+		if has(c, "error_code") {
+			return testdb.Result{Err: errBadField}
+		}
+		return testdb.Result{}
+	})
+	for i := 0; i < 2; i++ {
+		if err := st.FailOutbound(t.Context(), 7, 5, "INVALID_JID", "bad"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs := db.Calls()
+	if len(cs) != 3 {
+		t.Fatalf("statements: %+v", cs)
+	}
+	for _, c := range cs[1:] {
+		if has(c, "error_code") || c.Args[1] != "INVALID_JID: bad" {
+			t.Fatalf("legacy fail expected: %s %v", c.Query, c.Args)
+		}
+	}
+	if len(*logs) != 1 {
+		t.Fatalf("one log line: %v", *logs)
+	}
+}
+
+func TestFailOutboundClipsLongMessagesOnRuneBoundary(t *testing.T) {
+	st, db, _ := newStore(nil)
+	long := strings.Repeat("ñ", 400) // 800 bytes
+	if err := st.FailOutbound(t.Context(), 1, 5, "SEND_FAILED", long); err != nil {
+		t.Fatal(err)
+	}
+	msg := db.Calls()[0].Args[1].(string)
+	if len(msg) > 500 || !utf8.ValidString(msg) {
+		t.Fatalf("clipped message len %d valid %v", len(msg), utf8.ValidString(msg))
+	}
+}
+
+func TestMarkNewChatSentClearsErrorWithoutChat(t *testing.T) {
+	st, db, _ := newStore(nil)
+	if err := st.MarkNewChatSent(t.Context(), 9, "WAID"); err != nil {
+		t.Fatal(err)
+	}
+	c := db.Calls()[0]
+	if !has(c, "status = 'sent'", "error_code = NULL") || has(c, "chat_jid") || c.Args[0] != "WAID" || c.Args[1] != int64(9) {
+		t.Fatalf("unexpected %s %v", c.Query, c.Args)
+	}
+}
+
+func TestSetOutboundChat(t *testing.T) {
+	st, db, _ := newStore(nil)
+	if err := st.SetOutboundChat(t.Context(), 9, "1@lid"); err != nil {
+		t.Fatal(err)
+	}
+	c := db.Calls()[0]
+	if !has(c, "SET chat_jid = ?") || c.Args[0] != "1@lid" || c.Args[1] != int64(9) {
+		t.Fatalf("unexpected %s %v", c.Query, c.Args)
+	}
+}
+
+func TestClaimNewChatMessageIDOnlyOnUnclaimedResolveRow(t *testing.T) {
+	st, db, _ := newStore(nil)
+	ok, err := st.ClaimNewChatMessageID(t.Context(), 9, "WAID")
+	if err != nil || !ok {
+		t.Fatalf("claim %v %v", ok, err)
+	}
+	c := db.Calls()[0]
+	if !has(c, "SET whatsapp_message_id = ?", "status = 'resolve'", "whatsapp_message_id IS NULL") || c.Args[0] != "WAID" || c.Args[1] != int64(9) {
+		t.Fatalf("unexpected %s %v", c.Query, c.Args)
+	}
+
+	st, _, _ = newStore(func(testdb.Call) testdb.Result { return testdb.Result{NoRowsAffected: true} })
+	if ok, err := st.ClaimNewChatMessageID(t.Context(), 9, "WAID"); err != nil || ok {
+		t.Fatalf("a row that left 'resolve' is not claimed: %v %v", ok, err)
 	}
 }
 

@@ -8,3 +8,6 @@ whatsmeow.db-wal
 *.exe
 /wabridge
 /dist
+check-number.req
+check-number.res
+check-number.*.tmp
