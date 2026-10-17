@@ -44,6 +44,7 @@ type Bridge struct {
 	// WhatsApp calls of the new-chat path, fields so tests can stub them.
 	isOnWhatsApp func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error)
 	sendMessage  func(context.Context, types.JID, *waProto.Message, ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	newMessageID func() types.MessageID
 	lidForPN     func(context.Context, types.JID) (types.JID, error)
 	now          func() time.Time
 
@@ -88,6 +89,7 @@ func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Upl
 	b.decryptReaction = client.DecryptReaction
 	b.isOnWhatsApp = client.IsOnWhatsApp
 	b.sendMessage = client.SendMessage
+	b.newMessageID = client.GenerateMessageID
 	b.lidForPN = client.Store.LIDs.GetLIDForPN
 	st.SetLogger(func(format string, args ...any) { clientLog.Warnf(format, args...) })
 	client.AddEventHandler(b.handleEvent)

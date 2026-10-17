@@ -27,6 +27,8 @@ type Result struct {
 	Err  error
 	Cols []string
 	Rows [][]driver.Value
+	// NoRowsAffected makes an Exec report 0 rows affected (default 1).
+	NoRowsAffected bool
 }
 
 // Handler answers a statement. A zero Result is an empty success.
@@ -104,6 +106,9 @@ func (c *conn) ExecContext(_ context.Context, q string, args []driver.NamedValue
 	r := c.db.run(q, args, false)
 	if r.Err != nil {
 		return nil, r.Err
+	}
+	if r.NoRowsAffected {
+		return driver.RowsAffected(0), nil
 	}
 	return driver.RowsAffected(1), nil
 }

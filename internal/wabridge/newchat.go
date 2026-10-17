@@ -9,6 +9,7 @@ import (
 
 	"github.com/enviadores/wabridge/internal/store"
 
+	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -25,6 +26,16 @@ import (
 // WhatsApp fails with error_code NOT_ON_WHATSAPP and leaves no chat behind:
 // wa_chats is written only after a send to a JID WhatsApp confirmed.
 //
+// A cold message must go out at most once, and only while it is current:
+//   - The WhatsApp message ID is stored on the row before the send
+//     (ClaimNewChatMessageID). A bridge that restarts between the send and
+//     the stamp sends again with that same ID, which the recipient drops as
+//     a duplicate. Right after the send the row is stamped 'sent' first, then
+//     the chat, the message and the row's chat_jid are written.
+//   - A row older than newChatMaxAge is failed with EXPIRED, never sent: the
+//     web app counts a 'resolve' row older than 24 h as undelivered and lets
+//     staff write again, so sending it later would make two cold messages.
+//
 // Older bridges select only status='pending', so they never see these rows,
 // and the web app queues them only while the heartbeat announces "new_chat"
 // (store.BridgeFeatures).
@@ -39,6 +50,14 @@ const featureNewChat = "wa_outbound.to_phone"
 // are not paced.
 const newChatMinGap = 20 * time.Second
 
+// newChatMaxAge is how long a queued new-chat row may still be sent. The web
+// app (RetentionService::UNDELIVERED_AFTER_SECONDS) counts a 'resolve' row
+// older than 24 h as undelivered and lets staff contact the customer again.
+// An hour less here, so a row the bridge is still working on is never
+// already counted as undelivered there; older rows fail with EXPIRED, which
+// the web app reads as undelivered too.
+const newChatMaxAge = 23 * time.Hour
+
 // newChatCallTimeout bounds each WhatsApp call of the new-chat path, so a
 // stuck usync or send cannot stall the outbound loop.
 const newChatCallTimeout = 45 * time.Second
@@ -50,6 +69,7 @@ const (
 	codeSendFailed      = "SEND_FAILED"
 	codeLookupFailed    = "LOOKUP_FAILED"
 	codeUnsupportedKind = "UNSUPPORTED_KIND"
+	codeExpired         = "EXPIRED"
 )
 
 // mxPhoneRE is the only to_phone form the web app writes: +52 and the 10
@@ -65,11 +85,17 @@ type newChatRow struct {
 	Body            sql.NullString
 	Kind            sql.NullString
 	Attempts        int
+	// WAMessageID is the ID a previous attempt (maybe in an earlier process)
+	// claimed for the send. Set means the message may already be out.
+	WAMessageID sql.NullString
+	// Expired: created more than newChatMaxAge ago.
+	Expired bool
 }
 
 // newChatWrites is what a successful send still has to store. It is kept
-// until the wa_outbound row is stamped, so a stamp that fails is retried
-// without sending the message a second time.
+// until the wa_outbound row is stamped, so a stamp that fails is retried in
+// this process without sending the message a second time. Across a restart
+// the ID claimed on the row does that job (see the comment at the top).
 type newChatWrites struct {
 	chat  store.Chat
 	msg   store.Message
@@ -115,14 +141,16 @@ func (b *Bridge) processNewChats(ctx context.Context) {
 
 func (b *Bridge) queryResolveOutbound(ctx context.Context) (*newChatRow, error) {
 	rows, err := b.store.DB().QueryContext(ctx, `
-		SELECT id, client_request_id, to_phone, to_name, body, kind, attempts
+		SELECT id, client_request_id, to_phone, to_name, body, kind, attempts,
+		       whatsapp_message_id,
+		       TIMESTAMPDIFF(SECOND, created_at, NOW()) > ? AS expired
 		FROM wa_outbound
 		WHERE status = 'resolve'
 		  AND attempts < ?
 		  AND `+outboundBackoffSQL+`
 		ORDER BY id
 		LIMIT 1
-	`, outboundMaxAttempts)
+	`, int64(newChatMaxAge/time.Second), outboundMaxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +159,7 @@ func (b *Bridge) queryResolveOutbound(ctx context.Context) (*newChatRow, error) 
 		return nil, rows.Err()
 	}
 	var r newChatRow
-	if err := rows.Scan(&r.ID, &r.ClientRequestID, &r.ToPhone, &r.ToName, &r.Body, &r.Kind, &r.Attempts); err != nil {
+	if err := rows.Scan(&r.ID, &r.ClientRequestID, &r.ToPhone, &r.ToName, &r.Body, &r.Kind, &r.Attempts, &r.WAMessageID, &r.Expired); err != nil {
 		return nil, err
 	}
 	return &r, rows.Err()
@@ -146,6 +174,16 @@ func (b *Bridge) sendNewChatRow(ctx context.Context, r newChatRow) {
 	// Already sent, only the stamp is missing: never send again.
 	if w, ok := b.newChat.sent[r.ID]; ok {
 		b.finishNewChat(r.ID, w)
+		return
+	}
+	if r.Expired {
+		detail := "queued more than " + newChatMaxAge.String() + " ago, not sent"
+		if r.WAMessageID.Valid {
+			// A send may have gone out before the bridge stopped. Re-sending
+			// it this late is worse than reporting it undelivered.
+			detail += " (an earlier attempt may have sent it as " + r.WAMessageID.String + ")"
+		}
+		b.failNewChat(ctx, r.ID, codeExpired, detail)
 		return
 	}
 	if r.Kind.String != "text" || strings.TrimSpace(r.Body.String) == "" {
@@ -186,8 +224,27 @@ func (b *Bridge) sendNewChatRow(ctx context.Context, r newChatRow) {
 	}
 	storeJID := target.String()
 
+	// The message ID goes on the row before the send. A row that already
+	// has one may have been sent by an earlier process: the same ID makes
+	// the resend a duplicate the recipient drops.
+	waID := types.MessageID(r.WAMessageID.String)
+	if !r.WAMessageID.Valid || waID == "" {
+		waID = b.newMessageID()
+		claimed, err := b.store.ClaimNewChatMessageID(ctx, r.ID, string(waID))
+		if err != nil {
+			b.logger.Warnf("Outbound %d: could not store the message ID before sending, will retry: %v", r.ID, err)
+			return
+		}
+		if !claimed {
+			b.logger.Infof("Outbound %d is no longer waiting to be sent, skipped", r.ID)
+			return
+		}
+	} else {
+		b.logger.Infof("Outbound %d: an earlier attempt may have sent it, sending again as %s (the recipient drops a duplicate ID)", r.ID, waID)
+	}
+
 	sendCtx, cancel := context.WithTimeout(ctx, newChatCallTimeout)
-	resp, err := b.sendMessage(sendCtx, target, &waProto.Message{Conversation: proto.String(r.Body.String)})
+	resp, err := b.sendMessage(sendCtx, target, &waProto.Message{Conversation: proto.String(r.Body.String)}, whatsmeow.SendRequestExtra{ID: waID})
 	cancel()
 	if err != nil {
 		// The next attempt looks the number up again.
@@ -226,26 +283,30 @@ func (b *Bridge) sendNewChatRow(ctx context.Context, r newChatRow) {
 	b.finishNewChat(r.ID, w)
 }
 
-// finishNewChat stores a sent new-chat message: the chat row first, then the
-// message (its FK needs the chat), then the outbound stamp. A chat row that
-// cannot be written leaves chat_jid NULL on the stamp; the customer's reply
-// or a receipt creates the chat later. If the stamp itself fails the row
-// stays 'resolve' and the next tick retries the writes, never the send.
+// finishNewChat stores a sent new-chat message. The outbound stamp comes
+// first, so the row leaves 'resolve' as soon as possible. Then the chat row,
+// the message (its FK needs the chat) and the row's chat_jid. A chat row
+// that cannot be written leaves chat_jid NULL; the customer's reply or a
+// receipt creates the chat later. If the stamp fails the row stays
+// 'resolve' and the next tick retries the writes, never the send.
 func (b *Bridge) finishNewChat(id int64, w newChatWrites) {
-	chatJID := nullString(w.chat.JID)
-	if err := storeRetry(func(ctx context.Context) error { return b.store.UpsertChat(ctx, w.chat) }); err != nil {
-		b.logger.Errorf("Outbound %d sent as %s but the chat row could not be written: %v", id, w.waID, err)
-		chatJID = sql.NullString{}
-	} else if err := storeRetry(func(ctx context.Context) error { return b.store.InsertMessage(ctx, w.msg) }); err != nil {
-		b.logger.Warnf("Insert outbound wa_messages %s: %v", w.waID, err)
-	}
 	if err := storeRetry(func(ctx context.Context) error {
-		return b.store.MarkNewChatSent(ctx, id, chatJID, w.waID)
+		return b.store.MarkNewChatSent(ctx, id, w.waID)
 	}); err != nil {
 		b.logger.Errorf("Outbound %d sent as %s but could not be marked sent (will retry the stamp, not the send): %v", id, w.waID, err)
 		return
 	}
 	delete(b.newChat.sent, id)
+	if err := storeRetry(func(ctx context.Context) error { return b.store.UpsertChat(ctx, w.chat) }); err != nil {
+		b.logger.Errorf("Outbound %d sent as %s but the chat row could not be written: %v", id, w.waID, err)
+		return
+	}
+	if err := storeRetry(func(ctx context.Context) error { return b.store.InsertMessage(ctx, w.msg) }); err != nil {
+		b.logger.Warnf("Insert outbound wa_messages %s: %v", w.waID, err)
+	}
+	if err := storeRetry(func(ctx context.Context) error { return b.store.SetOutboundChat(ctx, id, w.chat.JID) }); err != nil {
+		b.logger.Warnf("Outbound %d sent as %s: could not set its chat_jid: %v", id, w.waID, err)
+	}
 	b.logger.Infof("Sent outbound %d (%s, new chat) -> %s", id, w.waID, w.label)
 }
 

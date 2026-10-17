@@ -800,33 +800,65 @@ func (s *Store) FailOutbound(ctx context.Context, id int64, attempts int, code, 
 	})
 }
 
-// MarkNewChatSent stamps a new-chat row (status='resolve') as sent. chatJID
-// is the wa_chats key the message was stored under, or NULL when the chat
-// row could not be written (the FK forbids pointing at a missing chat; the
-// customer's reply or a receipt creates it later).
-func (s *Store) MarkNewChatSent(ctx context.Context, id int64, chatJID sql.NullString, waMessageID string) error {
+// ClaimNewChatMessageID stores the WhatsApp message ID a new-chat row will be
+// sent with, before the send. A bridge that restarts between the send and the
+// stamp finds the ID on the row and sends again with the same ID, which the
+// recipient's WhatsApp drops as a duplicate, instead of a second message.
+// false means the row is no longer 'resolve' or already has an ID (someone
+// failed it by hand meanwhile): the caller must not send.
+func (s *Store) ClaimNewChatMessageID(ctx context.Context, id int64, waMessageID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE wa_outbound
+		SET whatsapp_message_id = ?
+		WHERE id = ?
+		  AND status = 'resolve'
+		  AND whatsapp_message_id IS NULL`, waMessageID, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// MarkNewChatSent stamps a new-chat row (status='resolve') as sent. It is
+// the first write after the send, so the row leaves 'resolve' as soon as
+// possible; chat_jid stays NULL until SetOutboundChat, because the FK needs
+// the wa_chats row the bridge writes next.
+func (s *Store) MarkNewChatSent(ctx context.Context, id int64, waMessageID string) error {
 	return s.Fallback(featureErrorCode, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			UPDATE wa_outbound
 			SET status = 'sent',
-			    chat_jid = ?,
 			    whatsapp_message_id = ?,
 			    sent_at = UTC_TIMESTAMP(),
 			    error_message = NULL,
 			    error_code = NULL
-			WHERE id = ?`, chatJID, waMessageID, id)
+			WHERE id = ?`, waMessageID, id)
 		return err
 	}, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			UPDATE wa_outbound
 			SET status = 'sent',
-			    chat_jid = ?,
 			    whatsapp_message_id = ?,
 			    sent_at = UTC_TIMESTAMP(),
 			    error_message = NULL
-			WHERE id = ?`, chatJID, waMessageID, id)
+			WHERE id = ?`, waMessageID, id)
 		return err
 	})
+}
+
+// SetOutboundChat points a sent new-chat row at the wa_chats row its message
+// was stored under. A row whose chat could not be written keeps chat_jid
+// NULL; the customer's reply or a receipt creates the chat later.
+func (s *Store) SetOutboundChat(ctx context.Context, id int64, chatJID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE wa_outbound
+		SET chat_jid = ?
+		WHERE id = ?`, chatJID, id)
+	return err
 }
 
 // clip cuts s to at most n bytes without splitting a UTF-8 sequence.

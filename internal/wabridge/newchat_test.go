@@ -37,7 +37,7 @@ func (r *resolveDB) handler(c testdb.Call) testdb.Result {
 		}
 	}
 	if c.IsQuery && strings.Contains(c.Query, "WHERE status = 'resolve'") {
-		res := testdb.Result{Cols: []string{"id", "client_request_id", "to_phone", "to_name", "body", "kind", "attempts"}}
+		res := testdb.Result{Cols: []string{"id", "client_request_id", "to_phone", "to_name", "body", "kind", "attempts", "whatsapp_message_id", "expired"}}
 		if len(r.rows) > 0 {
 			res.Rows = [][]driver.Value{r.rows[0]}
 			r.rows = r.rows[1:]
@@ -48,12 +48,18 @@ func (r *resolveDB) handler(c testdb.Call) testdb.Result {
 }
 
 func resolveRow(id int64, phone string, attempts int64) []driver.Value {
-	return []driver.Value{id, "req-" + phone, phone, "Ana Lopez", "Hola Ana", "text", attempts}
+	return []driver.Value{id, "req-" + phone, phone, "Ana Lopez", "Hola Ana", "text", attempts, nil, int64(0)}
 }
+
+const (
+	colWAMessageID = 7
+	colExpired     = 8
+)
 
 type stubWA struct {
 	lookups []string
 	sends   []types.JID
+	sendIDs []types.MessageID
 	res     []types.IsOnWhatsAppResponse
 	lookErr error
 	sendErr error
@@ -67,16 +73,21 @@ func newChatBridge(rdb *resolveDB, wa *stubWA) (*Bridge, *testdb.DB, *time.Time)
 		wa.lookups = append(wa.lookups, phones...)
 		return wa.res, wa.lookErr
 	}
-	b.sendMessage = func(_ context.Context, to types.JID, msg *waProto.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	b.sendMessage = func(_ context.Context, to types.JID, msg *waProto.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		if len(extra) != 1 || extra[0].ID == "" {
+			panic("new chat must send with the message ID claimed on the row")
+		}
 		wa.sends = append(wa.sends, to)
+		wa.sendIDs = append(wa.sendIDs, extra[0].ID)
 		if wa.sendErr != nil {
 			return whatsmeow.SendResponse{}, wa.sendErr
 		}
 		if msg.GetConversation() == "" {
 			panic("new chat must send the body as Conversation")
 		}
-		return whatsmeow.SendResponse{ID: "3EB0NEWCHAT", Timestamp: sentAt}, nil
+		return whatsmeow.SendResponse{ID: extra[0].ID, Timestamp: sentAt}, nil
 	}
+	b.newMessageID = func() types.MessageID { return "3EB0NEWCHAT" }
 	b.lidForPN = func(_ context.Context, pn types.JID) (types.JID, error) {
 		if pn == custPN {
 			return custLID, nil
@@ -101,6 +112,10 @@ func writes(db *testdb.DB) []string {
 			out = append(out, "chat")
 		case strings.HasPrefix(c.Query, "INSERT IGNORE INTO wa_messages"):
 			out = append(out, "message")
+		case strings.Contains(c.Query, "SET whatsapp_message_id = ?"):
+			out = append(out, "claim")
+		case strings.Contains(c.Query, "SET chat_jid = ?"):
+			out = append(out, "chat_jid")
 		case strings.Contains(c.Query, "SET status = 'sent'"):
 			out = append(out, "sent")
 		case strings.Contains(c.Query, "SET status = 'failed'"):
@@ -210,8 +225,14 @@ func TestNewChatResolvesLIDAndWritesChatThenMessageThenOutbound(t *testing.T) {
 	if len(wa.sends) != 1 || wa.sends[0] != custLID {
 		t.Fatalf("send to the LID: %v", wa.sends)
 	}
-	if got := strings.Join(writes(db), ","); got != "chat,message,sent" {
+	if got := strings.Join(writes(db), ","); got != "claim,sent,chat,message,chat_jid" {
 		t.Fatalf("write order %s", got)
+	}
+	if claim := calls(db, "SET whatsapp_message_id = ?")[0]; claim.Args[0] != "3EB0NEWCHAT" || claim.Args[1] != int64(42) {
+		t.Fatalf("claim args %v", claim.Args)
+	}
+	if len(wa.sendIDs) != 1 || wa.sendIDs[0] != "3EB0NEWCHAT" {
+		t.Fatalf("sent with the claimed ID: %v", wa.sendIDs)
 	}
 	chat := calls(db, "INSERT INTO wa_chats")[0]
 	// jid, display_name, phone_e164, is_group, pic, pic-marker, last_at, preview, from_me, unread, inc
@@ -226,11 +247,11 @@ func TestNewChatResolvesLIDAndWritesChatThenMessageThenOutbound(t *testing.T) {
 		t.Fatalf("message args %v", msg.Args)
 	}
 	sent := calls(db, "SET status = 'sent'")[0]
-	if !strings.Contains(sent.Query, "chat_jid = ?") || !strings.Contains(sent.Query, "error_code = NULL") {
-		t.Fatalf("sent stamp %s", sent.Query)
+	if !strings.Contains(sent.Query, "error_code = NULL") || sent.Args[0] != "3EB0NEWCHAT" || sent.Args[1] != int64(42) {
+		t.Fatalf("sent stamp %s %v", sent.Query, sent.Args)
 	}
-	if sent.Args[0] != custLID.String() || sent.Args[1] != "3EB0NEWCHAT" || sent.Args[2] != int64(42) {
-		t.Fatalf("sent args %v", sent.Args)
+	if cj := calls(db, "SET chat_jid = ?")[0]; cj.Args[0] != custLID.String() || cj.Args[1] != int64(42) {
+		t.Fatalf("chat_jid args %v", cj.Args)
 	}
 	if len(b.newChat.sent) != 0 {
 		t.Fatal("the resend guard must be cleared once stamped")
@@ -324,15 +345,14 @@ func TestNewChatLookupWarningWithAnswerStillSends(t *testing.T) {
 }
 
 func TestNewChatSendErrorRetriesThenFailsWithSendFailed(t *testing.T) {
-	rdb := &resolveDB{rows: [][]driver.Value{
-		resolveRow(1, "+525512345678", 0),
-		resolveRow(1, "+525512345678", outboundMaxAttempts-1),
-	}}
+	retry := resolveRow(1, "+525512345678", outboundMaxAttempts-1)
+	retry[colWAMessageID] = "3EB0NEWCHAT"
+	rdb := &resolveDB{rows: [][]driver.Value{resolveRow(1, "+525512345678", 0), retry}}
 	wa := &stubWA{res: inLID(), sendErr: errors.New("server returned error 479")}
 	b, db, clock := newChatBridge(rdb, wa)
 
 	b.processNewChats(context.Background())
-	if got := strings.Join(writes(db), ","); got != "attempt" {
+	if got := strings.Join(writes(db), ","); got != "claim,attempt" {
 		t.Fatalf("first failure retries: %s", got)
 	}
 	db.Reset()
@@ -343,6 +363,9 @@ func TestNewChatSendErrorRetriesThenFailsWithSendFailed(t *testing.T) {
 	}
 	if len(wa.lookups) != 2 {
 		t.Fatalf("each attempt looks the number up again: %v", wa.lookups)
+	}
+	if len(calls(db, "SET whatsapp_message_id = ?")) != 0 || wa.sendIDs[1] != "3EB0NEWCHAT" {
+		t.Fatalf("the retry reuses the claimed ID: %v", wa.sendIDs)
 	}
 	if len(calls(db, "wa_chats")) != 0 {
 		t.Fatal("no chat after a failed send")
@@ -368,8 +391,14 @@ func TestNewChatPostSendDBFailureNeverResends(t *testing.T) {
 		t.Fatal("no message row without its chat (FK)")
 	}
 	sent := calls(db, "SET status = 'sent'")
-	if len(sent) != 1 || sent[0].Args[0] != nil || sent[0].Args[2] != int64(7) {
-		t.Fatalf("marked sent with chat_jid NULL: %+v", sent)
+	if len(sent) != 1 || sent[0].Args[1] != int64(7) {
+		t.Fatalf("marked sent: %+v", sent)
+	}
+	if len(calls(db, "SET chat_jid = ?")) != 0 {
+		t.Fatal("chat_jid stays NULL without its chat row (FK)")
+	}
+	if got := strings.Join(writes(db), ","); got != "claim,sent,chat,chat,chat" {
+		t.Fatalf("the stamp comes before the chat (three tries): %s", got)
 	}
 }
 
@@ -395,7 +424,7 @@ func TestNewChatStampFailureRetriesWritesNotSend(t *testing.T) {
 	if len(wa.sends) != 1 || len(wa.lookups) != 1 {
 		t.Fatalf("no second lookup or send: %v %v", wa.lookups, wa.sends)
 	}
-	if got := strings.Join(writes(db), ","); got != "chat,message,sent" {
+	if got := strings.Join(writes(db), ","); got != "sent,chat,message,chat_jid" {
 		t.Fatalf("retried writes %s", got)
 	}
 	if len(b.newChat.sent) != 0 {
@@ -450,6 +479,9 @@ func TestResolveQueryShape(t *testing.T) {
 	q := calls(db, "WHERE status = 'resolve'")
 	if len(q) != 1 || !strings.Contains(q[0].Query, "attempts < ?") || !strings.Contains(q[0].Query, "CASE attempts") || !strings.HasSuffix(q[0].Query, "ORDER BY id LIMIT 1") {
 		t.Fatalf("resolve query %+v", q)
+	}
+	if !strings.Contains(q[0].Query, "TIMESTAMPDIFF(SECOND, created_at, NOW()) > ? AS expired") || q[0].Args[0] != int64(23*3600) {
+		t.Fatalf("expiry column %s %v", q[0].Query, q[0].Args)
 	}
 }
 
@@ -513,5 +545,116 @@ func TestCheckNumberAnswersRequestFileWithoutDBWrites(t *testing.T) {
 	}
 	if len(db.Calls()) != 0 {
 		t.Fatalf("check-number writes nothing to MySQL: %+v", db.Calls())
+	}
+}
+
+// The web app counts a 'resolve' row older than 24 h as undelivered and lets
+// staff write again; the bridge must never send such a row late.
+func TestNewChatExpiredRowFailsWithoutLookupOrSend(t *testing.T) {
+	stale := resolveRow(1, "+525512345678", 0)
+	stale[colExpired] = int64(1)
+	rdb := &resolveDB{rows: [][]driver.Value{stale, resolveRow(2, "+525598765432", 0)}}
+	wa := &stubWA{res: inLID()}
+	b, db, _ := newChatBridge(rdb, wa)
+	b.processNewChats(context.Background())
+	f := failedCall(t, db)
+	if f.Args[2] != codeExpired || !strings.HasPrefix(f.Args[1].(string), "EXPIRED: ") || f.Args[3] != int64(1) {
+		t.Fatalf("args %v", f.Args)
+	}
+	if len(wa.lookups)+len(wa.sends) != 0 || len(calls(db, "wa_chats")) != 0 {
+		t.Fatal("an expired row is never looked up or sent")
+	}
+	// Expiring takes no WhatsApp call, so it does not use up the pacing gap.
+	b.processNewChats(context.Background())
+	if len(wa.sends) != 1 {
+		t.Fatalf("the next current row goes out right away: %v", wa.sends)
+	}
+}
+
+func TestNewChatExpiredRowWithClaimedIDIsNotResent(t *testing.T) {
+	stale := resolveRow(1, "+525512345678", 0)
+	stale[colExpired] = int64(1)
+	stale[colWAMessageID] = "3EB0OLD"
+	rdb := &resolveDB{rows: [][]driver.Value{stale}}
+	wa := &stubWA{res: inLID()}
+	b, db, _ := newChatBridge(rdb, wa)
+	b.processNewChats(context.Background())
+	if f := failedCall(t, db); f.Args[2] != codeExpired || !strings.Contains(f.Args[1].(string), "3EB0OLD") {
+		t.Fatalf("args %v", f.Args)
+	}
+	if len(wa.sends) != 0 {
+		t.Fatal("no late resend")
+	}
+}
+
+// A restart between the send and the stamp: the new process has an empty
+// in-memory guard, but the ID claimed on the row makes the resend carry the
+// same message ID, which the recipient drops as a duplicate.
+func TestNewChatRestartResendsWithTheClaimedID(t *testing.T) {
+	row := resolveRow(7, "+525512345678", 0)
+	row[colWAMessageID] = "3EB0CLAIMED"
+	rdb := &resolveDB{rows: [][]driver.Value{row}}
+	wa := &stubWA{res: inLID()}
+	b, db, _ := newChatBridge(rdb, wa)
+	b.newMessageID = func() types.MessageID {
+		t.Fatal("a claimed row never gets a new ID")
+		return ""
+	}
+	b.processNewChats(context.Background())
+	if len(wa.sendIDs) != 1 || wa.sendIDs[0] != "3EB0CLAIMED" {
+		t.Fatalf("resent with the claimed ID: %v", wa.sendIDs)
+	}
+	if got := strings.Join(writes(db), ","); got != "sent,chat,message,chat_jid" {
+		t.Fatalf("writes %s", got)
+	}
+	if sent := calls(db, "SET status = 'sent'")[0]; sent.Args[0] != "3EB0CLAIMED" {
+		t.Fatalf("stamped with the claimed ID: %v", sent.Args)
+	}
+}
+
+func TestNewChatClaimFailureDoesNotSend(t *testing.T) {
+	rdb := &resolveDB{rows: [][]driver.Value{resolveRow(1, "+525512345678", 0)}}
+	rdb.fail = func(c testdb.Call) error {
+		if strings.Contains(c.Query, "SET whatsapp_message_id = ?") {
+			return errors.New("lost connection")
+		}
+		return nil
+	}
+	wa := &stubWA{res: inLID()}
+	b, db, _ := newChatBridge(rdb, wa)
+	b.processNewChats(context.Background())
+	if len(wa.sends) != 0 {
+		t.Fatal("no send without the ID stored first")
+	}
+	if got := strings.Join(writes(db), ","); got != "claim" {
+		t.Fatalf("nothing else is written: %s", got)
+	}
+}
+
+func TestNewChatRowThatLeftResolveIsNotSent(t *testing.T) {
+	b, db := newTestBridge(func(c testdb.Call) testdb.Result {
+		if c.IsQuery && strings.Contains(c.Query, "WHERE status = 'resolve'") {
+			return testdb.Result{
+				Cols: []string{"id", "client_request_id", "to_phone", "to_name", "body", "kind", "attempts", "whatsapp_message_id", "expired"},
+				Rows: [][]driver.Value{resolveRow(1, "+525512345678", 0)},
+			}
+		}
+		if strings.Contains(c.Query, "SET whatsapp_message_id = ?") {
+			return testdb.Result{NoRowsAffected: true}
+		}
+		return testdb.Result{}
+	})
+	wa := &stubWA{res: inLID()}
+	b.now = func() time.Time { return sentAt }
+	b.isOnWhatsApp = func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error) { return wa.res, nil }
+	b.newMessageID = func() types.MessageID { return "3EB0NEWCHAT" }
+	b.lidForPN = func(context.Context, types.JID) (types.JID, error) { return types.EmptyJID, nil }
+	b.sendMessage = func(context.Context, types.JID, *waProto.Message, ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		t.Fatal("a row failed by hand meanwhile is not sent")
+		return whatsmeow.SendResponse{}, nil
+	}
+	b.processNewChats(context.Background())
+	if len(calls(db, "SET status")) != 0 {
+		t.Fatalf("no stamp: %+v", db.Calls())
 	}
 }

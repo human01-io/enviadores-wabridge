@@ -521,14 +521,42 @@ func TestFailOutboundClipsLongMessagesOnRuneBoundary(t *testing.T) {
 	}
 }
 
-func TestMarkNewChatSentClearsErrorAndSetsChat(t *testing.T) {
+func TestMarkNewChatSentClearsErrorWithoutChat(t *testing.T) {
 	st, db, _ := newStore(nil)
-	if err := st.MarkNewChatSent(t.Context(), 9, sql.NullString{String: "1@lid", Valid: true}, "WAID"); err != nil {
+	if err := st.MarkNewChatSent(t.Context(), 9, "WAID"); err != nil {
 		t.Fatal(err)
 	}
 	c := db.Calls()[0]
-	if !has(c, "status = 'sent'", "chat_jid = ?", "error_code = NULL") || c.Args[0] != "1@lid" || c.Args[1] != "WAID" || c.Args[2] != int64(9) {
+	if !has(c, "status = 'sent'", "error_code = NULL") || has(c, "chat_jid") || c.Args[0] != "WAID" || c.Args[1] != int64(9) {
 		t.Fatalf("unexpected %s %v", c.Query, c.Args)
+	}
+}
+
+func TestSetOutboundChat(t *testing.T) {
+	st, db, _ := newStore(nil)
+	if err := st.SetOutboundChat(t.Context(), 9, "1@lid"); err != nil {
+		t.Fatal(err)
+	}
+	c := db.Calls()[0]
+	if !has(c, "SET chat_jid = ?") || c.Args[0] != "1@lid" || c.Args[1] != int64(9) {
+		t.Fatalf("unexpected %s %v", c.Query, c.Args)
+	}
+}
+
+func TestClaimNewChatMessageIDOnlyOnUnclaimedResolveRow(t *testing.T) {
+	st, db, _ := newStore(nil)
+	ok, err := st.ClaimNewChatMessageID(t.Context(), 9, "WAID")
+	if err != nil || !ok {
+		t.Fatalf("claim %v %v", ok, err)
+	}
+	c := db.Calls()[0]
+	if !has(c, "SET whatsapp_message_id = ?", "status = 'resolve'", "whatsapp_message_id IS NULL") || c.Args[0] != "WAID" || c.Args[1] != int64(9) {
+		t.Fatalf("unexpected %s %v", c.Query, c.Args)
+	}
+
+	st, _, _ = newStore(func(testdb.Call) testdb.Result { return testdb.Result{NoRowsAffected: true} })
+	if ok, err := st.ClaimNewChatMessageID(t.Context(), 9, "WAID"); err != nil || ok {
+		t.Fatalf("a row that left 'resolve' is not claimed: %v %v", ok, err)
 	}
 }
 
