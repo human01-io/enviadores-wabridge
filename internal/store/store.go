@@ -5,17 +5,89 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/enviadores/wabridge/internal/config"
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 type Store struct {
 	db *sql.DB
+
+	// logf receives diagnostics (ASCII only: the Windows box). Nil discards.
+	logf func(format string, args ...any)
+
+	// off holds the names of features whose newer columns the database does
+	// not have yet (see Fallback). Guarded by mu.
+	mu  sync.Mutex
+	off map[string]bool
+}
+
+// NewFromDB wraps an existing connection. Open uses it; tests use it with a
+// fake driver.
+func NewFromDB(db *sql.DB) *Store { return &Store{db: db} }
+
+// SetLogger installs the diagnostics sink (ASCII-only messages).
+func (s *Store) SetLogger(logf func(format string, args ...any)) { s.logf = logf }
+
+func (s *Store) log(format string, args ...any) {
+	if s.logf != nil {
+		s.logf(format, args...)
+	}
+}
+
+// mysqlErrBadField is MySQL error 1054 (ER_BAD_FIELD_ERROR): "Unknown column".
+const mysqlErrBadField = 1054
+
+// IsUnknownColumn reports whether err is MySQL's "Unknown column" error, which
+// is what a statement touching a column of a not-yet-applied migration raises.
+func IsUnknownColumn(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == mysqlErrBadField
+}
+
+// FeatureOff reports whether Fallback already switched the feature to its
+// legacy statement.
+func (s *Store) FeatureOff(feature string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.off[feature]
+}
+
+// Fallback runs newFn (a statement that uses columns from a newer migration).
+// If the database answers "unknown column", the feature is switched off for
+// the life of the process, one line is logged, and oldFn (the statement the
+// previous release ran) runs instead, now and on every later call. oldFn may
+// be nil when there is no legacy equivalent; then the call is skipped.
+//
+// The migration is applied before a release ships, so this is only a safety
+// net for a bridge that is started against an older schema.
+func (s *Store) Fallback(feature string, newFn, oldFn func() error) error {
+	if !s.FeatureOff(feature) {
+		err := newFn()
+		if err == nil || !IsUnknownColumn(err) {
+			return err
+		}
+		s.mu.Lock()
+		first := !s.off[feature]
+		if s.off == nil {
+			s.off = map[string]bool{}
+		}
+		s.off[feature] = true
+		s.mu.Unlock()
+		if first {
+			s.log("schema is missing columns for %q (%v) - using the legacy statement until restart", feature, err)
+		}
+	}
+	if oldFn == nil {
+		return nil
+	}
+	return oldFn()
 }
 
 func Open(ctx context.Context, cfg *config.Config, tunnelAddr string) (*Store, error) {
@@ -40,7 +112,7 @@ func Open(ctx context.Context, cfg *config.Config, tunnelAddr string) (*Store, e
 		_ = db.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
-	return &Store{db: db}, nil
+	return NewFromDB(db), nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -250,43 +322,423 @@ func (s *Store) UpdateProfilePic(ctx context.Context, jid string, url string) er
 }
 
 type Message struct {
-	ID              string
-	ChatJID         string
-	SenderJID       sql.NullString
-	FromMe          bool
-	MessageType     string
-	Body            sql.NullString
-	MediaURL        sql.NullString
-	MediaMime       sql.NullString
-	MediaSize       sql.NullInt64
-	MediaFilename   sql.NullString
-	MediaSHA256     sql.NullString
+	ID                string
+	ChatJID           string
+	SenderJID         sql.NullString
+	FromMe            bool
+	MessageType       string
+	Body              sql.NullString
+	MediaURL          sql.NullString
+	MediaMime         sql.NullString
+	MediaSize         sql.NullInt64
+	MediaFilename     sql.NullString
+	MediaSHA256       sql.NullString
 	MediaThumbnailURL sql.NullString
-	QuotedMessageID sql.NullString
-	ClientRequestID sql.NullString // set on outbound sends so the UI can match its optimistic bubble
-	Timestamp       time.Time
-	Status          sql.NullString
+	QuotedMessageID   sql.NullString
+	QuotedPreview     sql.NullString // short text of the quoted message
+	QuotedSenderJID   sql.NullString // who wrote the quoted message
+	TargetMessageID   sql.NullString // message_type='reaction': the message reacted to
+	ClientRequestID   sql.NullString // set on outbound sends so the UI can match its optimistic bubble
+	Timestamp         time.Time
+	Status            sql.NullString
 }
 
+// featureQuotes names the Fallback feature for the reply / reaction columns
+// of wa_messages (quoted_preview, quoted_sender_jid, target_message_id).
+const featureQuotes = "wa_messages.quotes"
+
+// featureEdits names the Fallback feature for edited_at / original_body /
+// revoked_at.
+const featureEdits = "wa_messages.edits"
+
+// featureHeartbeat names the Fallback feature for wa_pairing.last_seen_at.
+const featureHeartbeat = "wa_pairing.last_seen_at"
+
 // InsertMessage writes a single message. INSERT IGNORE so a re-delivered
-// message (same ID) doesn't error.
+// message (same ID) doesn't error. Against a schema without the reply columns
+// it degrades to the legacy column list (quote preview and reaction target
+// are dropped, everything else is stored).
 func (s *Store) InsertMessage(ctx context.Context, m Message) error {
-	const q = `
-		INSERT IGNORE INTO wa_messages (
-			id, chat_jid, sender_jid, from_me, message_type, body,
-			media_url, media_mime, media_size, media_filename, media_sha256,
-			media_thumbnail_url,
-			quoted_message_id, client_request_id, timestamp, status
+	return s.Fallback(featureQuotes, func() error {
+		const q = `
+			INSERT IGNORE INTO wa_messages (
+				id, chat_jid, sender_jid, from_me, message_type, body,
+				media_url, media_mime, media_size, media_filename, media_sha256,
+				media_thumbnail_url,
+				quoted_message_id, quoted_preview, quoted_sender_jid, target_message_id,
+				client_request_id, timestamp, status
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`
+		_, err := s.db.ExecContext(ctx, q,
+			m.ID, m.ChatJID, m.SenderJID, boolInt(m.FromMe), m.MessageType, m.Body,
+			m.MediaURL, m.MediaMime, m.MediaSize, m.MediaFilename, m.MediaSHA256,
+			m.MediaThumbnailURL,
+			m.QuotedMessageID, m.QuotedPreview, m.QuotedSenderJID, m.TargetMessageID,
+			m.ClientRequestID, m.Timestamp.UTC(), m.Status,
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-	_, err := s.db.ExecContext(ctx, q,
-		m.ID, m.ChatJID, m.SenderJID, boolInt(m.FromMe), m.MessageType, m.Body,
-		m.MediaURL, m.MediaMime, m.MediaSize, m.MediaFilename, m.MediaSHA256,
-		m.MediaThumbnailURL,
-		m.QuotedMessageID, m.ClientRequestID, m.Timestamp.UTC(), m.Status,
-	)
+		return err
+	}, func() error {
+		const q = `
+			INSERT IGNORE INTO wa_messages (
+				id, chat_jid, sender_jid, from_me, message_type, body,
+				media_url, media_mime, media_size, media_filename, media_sha256,
+				media_thumbnail_url,
+				quoted_message_id, client_request_id, timestamp, status
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`
+		_, err := s.db.ExecContext(ctx, q,
+			m.ID, m.ChatJID, m.SenderJID, boolInt(m.FromMe), m.MessageType, m.Body,
+			m.MediaURL, m.MediaMime, m.MediaSize, m.MediaFilename, m.MediaSHA256,
+			m.MediaThumbnailURL,
+			m.QuotedMessageID, m.ClientRequestID, m.Timestamp.UTC(), m.Status,
+		)
+		return err
+	})
+}
+
+// ErrNotAuthor is returned when an edit (or a 1:1 delete) names a message the
+// sender did not write. Official clients never send that; the event is ignored.
+var ErrNotAuthor = errors.New("message belongs to the other side")
+
+// ErrEditsUnsupported is returned by ApplyEdit when the schema predates the
+// edit columns: the original is left untouched and the caller stores the new
+// text as a row of its own (what the previous release did), so neither text
+// is lost.
+var ErrEditsUnsupported = errors.New("schema has no edit columns")
+
+// MessageRef says where a stored message lives.
+type MessageRef struct {
+	ChatJID string
+	FromMe  bool
+}
+
+// LocateMessage finds a message by its id among the forms its chat may be
+// stored under (canonical LID, raw phone JID...). wa_messages.id is the
+// primary key; the chat list only stops an event from one chat touching a
+// message of another. A chat whose LID mapping was learned after the
+// message was stored keeps that message under the phone JID, so callers
+// pass every alias they know.
+func (s *Store) LocateMessage(ctx context.Context, id string, chats []string) (MessageRef, bool, error) {
+	if id == "" || len(chats) == 0 {
+		return MessageRef{}, false, nil
+	}
+	ph := make([]string, len(chats))
+	args := make([]any, 0, len(chats)+1)
+	args = append(args, id)
+	for i, c := range chats {
+		ph[i] = "?"
+		args = append(args, c)
+	}
+	var ref MessageRef
+	var fromMe int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT chat_jid, from_me FROM wa_messages WHERE id = ? AND chat_jid IN (`+strings.Join(ph, ",")+`) LIMIT 1`,
+		args...).Scan(&ref.ChatJID, &fromMe)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MessageRef{}, false, nil
+	}
+	if err != nil {
+		return MessageRef{}, false, err
+	}
+	ref.FromMe = fromMe == 1
+	return ref, true, nil
+}
+
+// ApplyEdit rewrites the body of an existing message after its author edited
+// it: original_body keeps the text from before the FIRST edit (an address a
+// customer later changes is worth auditing), body takes the new text and
+// edited_at is stamped. No new row is created. found=false means the original
+// is not stored under any of chats; ErrNotAuthor means it was written by the
+// other side; ErrEditsUnsupported means the schema has no edit columns (the
+// original is left as it was). ref.ChatJID is the chat the row lives in.
+func (s *Store) ApplyEdit(ctx context.Context, chats []string, targetID string, fromMe bool, newBody sql.NullString) (MessageRef, bool, error) {
+	ref, found, err := s.LocateMessage(ctx, targetID, chats)
+	if err != nil || !found {
+		return ref, found, err
+	}
+	if ref.FromMe != fromMe {
+		return ref, true, ErrNotAuthor
+	}
+	err = s.Fallback(featureEdits, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE wa_messages
+			SET original_body = COALESCE(original_body, body),
+			    body          = ?,
+			    edited_at     = UTC_TIMESTAMP()
+			WHERE id = ? AND chat_jid = ?
+		`, newBody, targetID, ref.ChatJID)
+		return err
+	}, nil)
+	if err != nil {
+		return ref, true, err
+	}
+	if s.FeatureOff(featureEdits) {
+		return ref, true, ErrEditsUnsupported
+	}
+	return ref, true, nil
+}
+
+// RevokeMessage marks the original message as deleted for everyone, keeping
+// its body for audit (the PHP layer hides it). In a 1:1 chat only the author
+// can delete (ErrNotAuthor otherwise); in a group an admin may delete anyone's
+// message. found=false when the original is not stored, or when the schema
+// predates revoked_at; the caller then keeps the old behaviour and inserts a
+// 'revoked' row.
+func (s *Store) RevokeMessage(ctx context.Context, chats []string, targetID string, fromMe, isGroup bool) (MessageRef, bool, error) {
+	if s.FeatureOff(featureEdits) {
+		return MessageRef{}, false, nil
+	}
+	ref, found, err := s.LocateMessage(ctx, targetID, chats)
+	if err != nil || !found {
+		return ref, found, err
+	}
+	if !isGroup && ref.FromMe != fromMe {
+		return ref, true, ErrNotAuthor
+	}
+	err = s.Fallback(featureEdits, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE wa_messages
+			SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP())
+			WHERE id = ? AND chat_jid = ?
+		`, targetID, ref.ChatJID)
+		return err
+	}, nil)
+	if err != nil {
+		return ref, true, err
+	}
+	if s.FeatureOff(featureEdits) {
+		return ref, false, nil
+	}
+	return ref, true, nil
+}
+
+// Reaction is one reaction event. Emoji == "" means the sender removed theirs.
+type Reaction struct {
+	ID        string // id of the reaction message itself
+	ChatJID   string
+	SenderJID sql.NullString
+	// SenderAliases are every form of the sender's JID (without a device
+	// suffix: phone and LID) that an earlier reaction of theirs may be stored
+	// under. Group chats match on them; empty means SenderJID alone.
+	SenderAliases []string
+	FromMe        bool
+	IsGroup       bool
+	TargetID      string // the message reacted to
+	Emoji         string
+	Timestamp     time.Time
+}
+
+// UpsertReaction keeps one reaction per (sender, target message): a new
+// reaction replaces the sender's previous one, and an empty emoji removes it.
+//
+// The bridge's MySQL user has no DELETE grant, so "remove" is a soft delete:
+// the row flips to message_type='system' (hidden everywhere, excluded from
+// the reaction aggregation) and keeps its target_message_id so a later
+// reaction by the same sender revives it. In a 1:1 chat there are only two
+// possible reactors, so the match is on from_me alone: the contact's sender
+// JID can flip between phone and LID form between events. In a group the
+// match is on every known form of the sender (SenderAliases), so a member who
+// reacts from another device or under their LID still has one reaction.
+//
+// The reacted-to message gets its status_updated_at bumped so the web
+// client's incremental refresh picks the new chip up.
+func (s *Store) UpsertReaction(ctx context.Context, r Reaction) error {
+	if r.TargetID == "" {
+		return nil
+	}
+	var existing string
+	err := s.Fallback(featureQuotes, func() error {
+		q := `SELECT id FROM wa_messages
+			WHERE chat_jid = ? AND target_message_id = ?
+			  AND message_type IN ('reaction', 'system') AND from_me = ?`
+		args := []any{r.ChatJID, r.TargetID, boolInt(r.FromMe)}
+		if !r.FromMe && r.IsGroup {
+			senders := r.SenderAliases
+			if len(senders) == 0 {
+				senders = []string{r.SenderJID.String}
+			}
+			ph := make([]string, len(senders))
+			for i, sj := range senders {
+				ph[i] = "?"
+				args = append(args, sj)
+			}
+			q += ` AND sender_jid IN (` + strings.Join(ph, ",") + `)`
+		}
+		q += ` ORDER BY timestamp DESC LIMIT 1`
+		e := s.db.QueryRowContext(ctx, q, args...).Scan(&existing)
+		if errors.Is(e, sql.ErrNoRows) {
+			return nil
+		}
+		return e
+	}, func() error {
+		// No target_message_id column: nothing to match on or to aggregate.
+		// Keep the legacy behaviour (store the reaction as a plain row).
+		if r.Emoji == "" {
+			return nil
+		}
+		return s.insertLegacyReaction(ctx, r)
+	})
+	if err != nil {
+		return err
+	}
+	if s.FeatureOff(featureQuotes) {
+		return nil
+	}
+
+	switch {
+	case existing != "" && r.Emoji == "":
+		if _, err = s.db.ExecContext(ctx, `
+			UPDATE wa_messages SET message_type = 'system', body = NULL, timestamp = ?
+			WHERE id = ? AND timestamp <= ?
+		`, r.Timestamp.UTC(), existing, r.Timestamp.UTC()); err != nil {
+			return err
+		}
+	case existing != "":
+		if _, err = s.db.ExecContext(ctx, `
+			UPDATE wa_messages SET message_type = 'reaction', body = ?, timestamp = ?
+			WHERE id = ? AND timestamp <= ?
+		`, r.Emoji, r.Timestamp.UTC(), existing, r.Timestamp.UTC()); err != nil {
+			return err
+		}
+	case r.Emoji == "":
+		return nil // removal of a reaction we never stored
+	default:
+		if err = s.InsertMessage(ctx, Message{
+			ID:              r.ID,
+			ChatJID:         r.ChatJID,
+			SenderJID:       r.SenderJID,
+			FromMe:          r.FromMe,
+			MessageType:     "reaction",
+			Body:            sql.NullString{String: r.Emoji, Valid: true},
+			TargetMessageID: sql.NullString{String: r.TargetID, Valid: true},
+			Timestamp:       r.Timestamp,
+			Status:          sql.NullString{String: reactionStatus(r.FromMe), Valid: true},
+		}); err != nil {
+			return err
+		}
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE wa_messages SET status_updated_at = UTC_TIMESTAMP()
+		WHERE id = ? AND chat_jid = ?
+	`, r.TargetID, r.ChatJID)
 	return err
+}
+
+func (s *Store) insertLegacyReaction(ctx context.Context, r Reaction) error {
+	return s.InsertMessage(ctx, Message{
+		ID:          r.ID,
+		ChatJID:     r.ChatJID,
+		SenderJID:   r.SenderJID,
+		FromMe:      r.FromMe,
+		MessageType: "reaction",
+		Body:        sql.NullString{String: r.Emoji, Valid: true},
+		Timestamp:   r.Timestamp,
+		Status:      sql.NullString{String: reactionStatus(r.FromMe), Valid: true},
+	})
+}
+
+func reactionStatus(fromMe bool) string {
+	if fromMe {
+		return "sent"
+	}
+	return "received"
+}
+
+// QuotedRow is what an outbound reply or reaction needs to know about the
+// message it points at.
+type QuotedRow struct {
+	SenderJID     sql.NullString
+	FromMe        bool
+	MessageType   string
+	Body          sql.NullString
+	MediaFilename sql.NullString
+	// Revoked is true when the message was deleted for everyone (revoked_at
+	// set, or a legacy 'revoked' row). Its body is kept for audit only and
+	// must never be sent again inside a quote.
+	Revoked bool
+}
+
+// Quotable reports whether a reply or a reaction may point at the row:
+// never at a deleted message, a reaction or a protocol row.
+func (r QuotedRow) Quotable() bool {
+	if r.Revoked {
+		return false
+	}
+	switch r.MessageType {
+	case "revoked", "reaction", "system":
+		return false
+	}
+	return true
+}
+
+// GetQuotedRow loads the message a reply or reaction targets. found=false
+// means the row is not in the table.
+func (s *Store) GetQuotedRow(ctx context.Context, chatJID, id string) (row QuotedRow, found bool, err error) {
+	scan := func(q string) func() error {
+		return func() error {
+			var fromMe, revoked int
+			e := s.db.QueryRowContext(ctx, q, id, chatJID).Scan(
+				&row.SenderJID, &fromMe, &row.MessageType, &row.Body, &row.MediaFilename, &revoked)
+			row.FromMe = fromMe == 1
+			row.Revoked = revoked == 1
+			return e
+		}
+	}
+	err = s.Fallback(featureEdits,
+		scan(`SELECT sender_jid, from_me, message_type, body, media_filename, revoked_at IS NOT NULL
+			FROM wa_messages WHERE id = ? AND chat_jid = ? LIMIT 1`),
+		scan(`SELECT sender_jid, from_me, message_type, body, media_filename, 0
+			FROM wa_messages WHERE id = ? AND chat_jid = ? LIMIT 1`))
+	if errors.Is(err, sql.ErrNoRows) {
+		return QuotedRow{}, false, nil
+	}
+	if err != nil {
+		return QuotedRow{}, false, err
+	}
+	return row, true, nil
+}
+
+// ClearUnreadUpTo handles a read receipt from one of our own devices (the
+// staff read the chat on the phone or WhatsApp Web). The receipt names the
+// messages that were read; inbound messages newer than the newest of them
+// arrived after that read and stay unread. When none of the ids is stored the
+// whole chat is cleared, as before. The count never goes up.
+func (s *Store) ClearUnreadUpTo(ctx context.Context, chatJID string, readIDs []string) error {
+	if len(readIDs) == 0 {
+		return nil
+	}
+	ph := make([]string, len(readIDs))
+	args := make([]any, 0, len(readIDs)+1)
+	for i, id := range readIDs {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, chatJID)
+	q := `
+		UPDATE wa_chats c
+		SET c.unread_count = LEAST(c.unread_count, (
+			SELECT COUNT(*) FROM wa_messages m
+			WHERE m.chat_jid = c.jid
+			  AND m.from_me = 0
+			  AND m.message_type NOT IN ('reaction', 'system')
+			  AND m.timestamp > COALESCE(
+			      (SELECT MAX(r.timestamp) FROM wa_messages r WHERE r.id IN (` + strings.Join(ph, ",") + `)),
+			      '9999-12-31')
+		))
+		WHERE c.jid = ? AND c.unread_count > 0`
+	_, err := s.db.ExecContext(ctx, q, args...)
+	return err
+}
+
+// Heartbeat stamps wa_pairing.last_seen_at so the web app can tell a live
+// bridge from a dead one. Missing column: logged once, then skipped.
+func (s *Store) Heartbeat(ctx context.Context) error {
+	return s.Fallback(featureHeartbeat, func() error {
+		_, err := s.db.ExecContext(ctx, `UPDATE wa_pairing SET last_seen_at = NOW() WHERE id = 1`)
+		return err
+	}, nil)
 }
 
 // MarkMessagesStatus updates wa_messages.status for the given IDs, but
@@ -339,28 +791,55 @@ func (s *Store) MarkMessagesStatus(ctx context.Context, ids []string, newStatus 
 	return err
 }
 
+// TailRow is the newest countable message of a chat.
+type TailRow struct {
+	MessageType   string
+	Body          sql.NullString
+	MediaFilename sql.NullString
+	Revoked       bool
+	FromMe        bool
+	Timestamp     time.Time
+}
+
 // RecomputeChatTail refreshes last_message_at / preview / from_me on a chat
 // from whatever is currently in wa_messages. Used after backfilling history
-// in bulk so the chat list reflects the most recent timestamp without each
-// insert paying the cost of an UpsertChat.
-func (s *Store) RecomputeChatTail(ctx context.Context, chatJID string) error {
-	const q = `
-		UPDATE wa_chats c
-		LEFT JOIN (
-			SELECT chat_jid,
-			       MAX(timestamp) AS max_ts
-			FROM wa_messages
-			WHERE chat_jid = ?
-			GROUP BY chat_jid
-		) agg ON agg.chat_jid = c.jid
-		LEFT JOIN wa_messages tail
-		       ON tail.chat_jid = c.jid AND tail.timestamp = agg.max_ts
-		SET c.last_message_at      = agg.max_ts,
-		    c.last_message_preview = LEFT(COALESCE(tail.body, ''), 160),
-		    c.last_message_from_me = COALESCE(tail.from_me, 0)
-		WHERE c.jid = ?
-	`
-	_, err := s.db.ExecContext(ctx, q, chatJID, chatJID)
+// in bulk, and after an edit or a revoke changed what the tail row says.
+// Reaction and system rows never count as the tail (WhatsApp does not move a
+// chat for a reaction). preview builds the list label from the tail row with
+// the same rules the live path uses (a caption-less photo is "Imagen", not
+// blank). A chat with no countable row is left as it is.
+func (s *Store) RecomputeChatTail(ctx context.Context, chatJID string, preview func(TailRow) string) error {
+	var t TailRow
+	scan := func(q string) func() error {
+		return func() error {
+			var fromMe, revoked int
+			e := s.db.QueryRowContext(ctx, q, chatJID).Scan(
+				&t.MessageType, &t.Body, &t.MediaFilename, &revoked, &fromMe, &t.Timestamp)
+			t.FromMe = fromMe == 1
+			t.Revoked = revoked == 1
+			return e
+		}
+	}
+	const tail = `
+		FROM wa_messages
+		WHERE chat_jid = ?
+		  AND message_type NOT IN ('reaction', 'system')
+		ORDER BY timestamp DESC, id DESC
+		LIMIT 1`
+	err := s.Fallback(featureEdits,
+		scan(`SELECT message_type, body, media_filename, revoked_at IS NOT NULL, from_me, timestamp`+tail),
+		scan(`SELECT message_type, body, media_filename, 0, from_me, timestamp`+tail))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE wa_chats
+		SET last_message_at = ?, last_message_preview = ?, last_message_from_me = ?
+		WHERE jid = ?
+	`, t.Timestamp.UTC(), preview(t), boolInt(t.FromMe), chatJID)
 	return err
 }
 
