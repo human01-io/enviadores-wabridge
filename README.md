@@ -5,8 +5,9 @@ into the `env_producto` MySQL database, so the platform's `/whatsapp` inbox
 page (gated to `role=admin_user @ PDV0000001`) can read them.
 
 Designed to run on **one Windows machine** at the PDV0000001 office, with one
-linked WhatsApp Business number. It's a read-mostly bridge — it doesn't send
-replies, just captures inbound chats and media.
+linked WhatsApp Business number. It captures inbound chats and media and sends
+what the web inbox queues in `wa_outbound` (text, media, quoted replies,
+reactions).
 
 ## What it does
 
@@ -44,6 +45,12 @@ on the active chat, so latency end-to-end is single-digit seconds.
   GRANT SELECT, INSERT, UPDATE ON <db>.wa_typing_outbound TO 'wabridge'@'localhost';
   ```
   Production (Enviadores, Vultr) runs exactly these grants since 2026-10-01.
+  This release (edits, deletes, replies, reactions, read sync, heartbeat) needs
+  **no new grant**: it only adds columns to `wa_messages`, `wa_outbound` and
+  `wa_pairing`, which the grants above already cover. `wa_ui_events` and
+  `wa_quick_replies` are written by the PHP API only, so the bridge user must
+  not get them. The bridge still never issues a `DELETE`: removing a reaction
+  flips its row to `message_type='system'` instead.
   When a new release touches another table, add that table's grant before
   deploying it. A host that can't do per-table grants (some shared cPanel
   plans) is not a supported target.
@@ -79,6 +86,42 @@ go build -o wabridge ./cmd/wabridge
 The same `config.yaml` works on every platform — `~/.ssh/id_ed25519` is
 expanded per-OS. All platform-specific service plumbing (launchd, systemd,
 Windows SCM) is handled by `kardianos/service` behind `wabridge install`.
+
+## Edits, deletes, replies, reactions
+
+Behaviour of the `feat/edits-replies-reactions` release. It needs the
+`wa_messages` / `wa_outbound` / `wa_pairing` column migration applied first
+(`docs/env_producto_db/migrations/` in the platform repo); a bridge started
+against an older schema logs one line per missing feature and keeps working
+with the old statements.
+
+- **Edits** (`ProtocolMessage` MESSAGE_EDIT, also the encrypted
+  `SecretEncryptedMessage` form) rewrite the original row: `original_body`
+  keeps the text from before the first edit, `body` is the new text,
+  `edited_at` is stamped. No new row. An edit of a message the bridge never
+  stored, or one whose secret is gone, is ignored (logged at info).
+- **Deletes for everyone** set `revoked_at` on the original (the body stays for
+  audit; the PHP API hides it). If the original is not stored, a `revoked` row
+  is inserted as before.
+- **Reactions** are stored as `message_type='reaction'` rows with
+  `target_message_id`. One per sender per message: a new emoji replaces the
+  old one, an empty one removes it. They never change the chat's preview,
+  order or unread count; the reacted-to message gets its `status_updated_at`
+  bumped so the web client refreshes it.
+- **Replies** are read from the `ContextInfo` of every content type into
+  `quoted_message_id`, `quoted_sender_jid` and `quoted_preview`. Outbound
+  `wa_outbound.quoted_message_id` sends a quoted reply (text or media);
+  `kind='reaction'` sends a reaction (body = emoji, empty = remove).
+- **Noise**: `@bot` (Meta AI) chats and WhatsApp Status are skipped; protocol
+  plumbing is never stored; album children are stored as normal images.
+- **Read sync**: a read receipt from one of our own devices zeroes the chat's
+  `unread_count`.
+- **Heartbeat**: `wa_pairing.last_seen_at` is stamped on connect and every
+  30 s while connected.
+
+Tests: `go test ./...` (SQL paths run against `internal/testdb`, an in-memory
+driver that records statements; no MySQL needed). Production is Windows, so
+also check `GOOS=windows go build ./...`.
 
 ## First run (QR pairing)
 
@@ -140,14 +183,14 @@ run `wabridge run` in the foreground.
 cmd/wabridge/main.go          entry point + Windows service wiring
 internal/config/              YAML loader
 internal/tunnel/              SSH tunnel + SFTP client (one shared connection)
-internal/store/               MySQL writes (wa_chats, wa_messages)
+internal/store/               MySQL writes (wa_chats, wa_messages) + unknown-column fallback
+internal/testdb/              in-memory database/sql driver for unit tests
 internal/media/               SFTP media upload + sha256 dedup
 internal/wabridge/            whatsmeow event handler — the orchestration glue
 ```
 
 ## What this bridge does NOT do (yet)
 
-- Send replies. Read-only by design — you reply from the phone.
 - Group chat subjects. Only DM `display_name` is populated (from `PushName`).
 - Forward profile-picture URLs through SFTP — they're stored as temporary
   WhatsApp signed URLs and may 404. The React UI falls back to initials.

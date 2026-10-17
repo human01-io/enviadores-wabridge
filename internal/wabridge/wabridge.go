@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/enviadores/wabridge/internal/config"
 	"github.com/enviadores/wabridge/internal/media"
@@ -35,6 +36,10 @@ type Bridge struct {
 	client   *whatsmeow.Client
 	logger   waLog.Logger
 	fatalCh  chan error
+
+	// Decryption entry points, fields so tests can stub them.
+	decryptSecret   secretDecryptor
+	decryptReaction func(context.Context, *events.Message) (*waProto.ReactionMessage, error)
 }
 
 func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, error) {
@@ -69,6 +74,9 @@ func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Upl
 		logger:   clientLog,
 		fatalCh:  make(chan error, 1),
 	}
+	b.decryptSecret = client.DecryptSecretEncryptedMessage
+	b.decryptReaction = client.DecryptReaction
+	st.SetLogger(func(format string, args ...any) { clientLog.Warnf(format, args...) })
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
 }
@@ -175,6 +183,7 @@ func (b *Bridge) handleEvent(evt interface{}) {
 		// "online"/last-seen to all contacts — a known trade-off of
 		// enabling the typing feature.
 		go b.markOnline(context.Background())
+		go b.heartbeat()
 		// Flush any peer_typing_until rows left over from a previous
 		// session: we have no way to know if those contacts are
 		// still composing.
@@ -275,6 +284,7 @@ func (b *Bridge) WatchConnection(ctx context.Context) error {
 		case <-ticker.C:
 			if b.client.IsConnected() {
 				disconnectedSince = time.Time{}
+				b.heartbeat()
 				continue
 			}
 			if disconnectedSince.IsZero() {
@@ -285,6 +295,16 @@ func (b *Bridge) WatchConnection(ctx context.Context) error {
 				return fmt.Errorf("disconnected for >%s - restarting", disconnectThreshold)
 			}
 		}
+	}
+}
+
+// heartbeat stamps wa_pairing.last_seen_at so the web app can show whether
+// the bridge is alive. Runs on connect and every 30 s from WatchConnection.
+func (b *Bridge) heartbeat() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.store.Heartbeat(ctx); err != nil {
+		b.logger.Warnf("heartbeat: %v", err)
 	}
 }
 
@@ -314,6 +334,9 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 		rawChatJID, err := types.ParseJID(conv.GetID())
 		if err != nil {
 			b.logger.Warnf("History sync: bad JID %s: %v", conv.GetID(), err)
+			continue
+		}
+		if isSkippedChat(rawChatJID) {
 			continue
 		}
 		// Canonicalize PN → LID for the storage keys so history-sync rows
@@ -360,10 +383,27 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 				continue
 			}
 
+			// Deletes for everyone inside the history flag the original
+			// row instead of adding a "deleted" bubble next to it.
+			if act := resolveAction(ctx, parsed, nil); act.Kind == actionRevoke {
+				if found, rerr := b.store.RevokeMessage(ctx, chatJIDStr, act.TargetID); rerr == nil && found {
+					continue
+				}
+			}
+
 			msgType, body, mediaInfo := classifyMessage(parsed.Message)
 			if msgType == "system" {
 				continue
 			}
+			if msgType == "reaction" {
+				if rm, ok, _ := reactionOf(ctx, parsed, nil); ok && rm != nil {
+					if rerr := b.store.UpsertReaction(ctx, reactionRecord(parsed.Info, chatJIDStr, rm)); rerr != nil {
+						b.logger.Warnf("History sync reaction %s: %v", parsed.Info.ID, rerr)
+					}
+				}
+				continue
+			}
+			quote := quoteFromContext(contextInfoOf(parsed.Message))
 
 			var mediaName, mediaMime sql.NullString
 			if mediaInfo != nil {
@@ -377,16 +417,19 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 			}
 
 			m := store.Message{
-				ID:            parsed.Info.ID,
-				ChatJID:       chatJIDStr,
-				SenderJID:     senderJID,
-				FromMe:        parsed.Info.IsFromMe,
-				MessageType:   msgType,
-				Body:          nullString(body),
-				MediaMime:     mediaMime,
-				MediaFilename: mediaName,
-				Timestamp:     parsed.Info.Timestamp,
-				Status:        sql.NullString{String: defaultStatus(parsed.Info.IsFromMe), Valid: true},
+				ID:              parsed.Info.ID,
+				ChatJID:         chatJIDStr,
+				SenderJID:       senderJID,
+				FromMe:          parsed.Info.IsFromMe,
+				MessageType:     msgType,
+				Body:            nullString(body),
+				MediaMime:       mediaMime,
+				MediaFilename:   mediaName,
+				QuotedMessageID: quote.MessageID,
+				QuotedPreview:   quote.Preview,
+				QuotedSenderJID: quote.SenderJID,
+				Timestamp:       parsed.Info.Timestamp,
+				Status:          sql.NullString{String: defaultStatus(parsed.Info.IsFromMe), Valid: true},
 			}
 			if err := b.store.InsertMessage(ctx, m); err != nil {
 				// transient row error — keep going on the next message
@@ -436,8 +479,9 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	// SSH-tunneled MySQL link, hit the 60s context deadline, and stall
 	// real inbound behind them. Filtering at the top is the cheapest
 	// fix and lets the React UI carry on as before (it never showed
-	// status@broadcast anyway).
-	if evt.Info.Chat.Server == types.BroadcastServer && evt.Info.Chat.User == "status" {
+	// status@broadcast anyway). Chats on the bot server (Meta AI) are noise
+	// of the same kind.
+	if isSkippedChat(evt.Info.Chat) {
 		return
 	}
 
@@ -452,6 +496,20 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	fromMe := evt.Info.IsFromMe
 	timestamp := evt.Info.Timestamp
 
+	// Edits and deletes act on an earlier row instead of adding one.
+	if b.applyProtocolAction(ctx, evt, chatJID, resolveAction(ctx, evt, b.decryptSecret)) {
+		return
+	}
+	// Reactions update the reacted-to message; they never move the chat.
+	if rm, isReaction, rerr := reactionOf(ctx, evt, b.decryptReaction); isReaction {
+		if rerr != nil || rm == nil {
+			b.logger.Infof("Reaction %s not stored: %v", evt.Info.ID, rerr)
+			return
+		}
+		b.storeReaction(ctx, evt, chatJID, rm)
+		return
+	}
+
 	msgType, body, mediaInfo := classifyMessage(evt.Message)
 	// 'system' rows are E2E protocol envelopes (SenderKeyDistribution
 	// etc.) — never user-facing. Skipping them here keeps wa_chats
@@ -460,15 +518,16 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	if msgType == "system" {
 		return
 	}
+	quote := quoteFromContext(contextInfoOf(evt.Message))
 
 	// Download & upload media if present.
 	var (
-		mediaURL       sql.NullString
-		mediaMime      sql.NullString
-		mediaSize      sql.NullInt64
-		mediaName      sql.NullString
-		mediaSHA256    sql.NullString
-		mediaThumbURL  sql.NullString
+		mediaURL      sql.NullString
+		mediaMime     sql.NullString
+		mediaSize     sql.NullInt64
+		mediaName     sql.NullString
+		mediaSHA256   sql.NullString
+		mediaThumbURL sql.NullString
 	)
 	if mediaInfo != nil {
 		data, err := b.client.Download(ctx, mediaInfo.downloadable)
@@ -519,24 +578,84 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	}
 
 	msg := store.Message{
-		ID:              evt.Info.ID,
-		ChatJID:         chatJID,
-		SenderJID:       nullString(senderJID),
-		FromMe:          fromMe,
-		MessageType:     msgType,
-		Body:            nullString(body),
-		MediaURL:        mediaURL,
-		MediaMime:       mediaMime,
-		MediaSize:       mediaSize,
-		MediaFilename:   mediaName,
+		ID:                evt.Info.ID,
+		ChatJID:           chatJID,
+		SenderJID:         nullString(senderJID),
+		FromMe:            fromMe,
+		MessageType:       msgType,
+		Body:              nullString(body),
+		MediaURL:          mediaURL,
+		MediaMime:         mediaMime,
+		MediaSize:         mediaSize,
+		MediaFilename:     mediaName,
 		MediaSHA256:       mediaSHA256,
 		MediaThumbnailURL: mediaThumbURL,
-		QuotedMessageID: sql.NullString{}, // wired in a later iteration if needed
-		Timestamp:       timestamp,
-		Status:          sql.NullString{String: defaultStatus(fromMe), Valid: true},
+		QuotedMessageID:   quote.MessageID,
+		QuotedPreview:     quote.Preview,
+		QuotedSenderJID:   quote.SenderJID,
+		Timestamp:         timestamp,
+		Status:            sql.NullString{String: defaultStatus(fromMe), Valid: true},
 	}
 	if err := b.store.InsertMessage(ctx, msg); err != nil {
 		b.logger.Errorf("InsertMessage %s: %v", evt.Info.ID, err)
+	}
+}
+
+// applyProtocolAction carries out an edit or a delete-for-everyone against the
+// stored original. It reports whether the event was fully handled (and so
+// must not be stored as a message of its own).
+func (b *Bridge) applyProtocolAction(ctx context.Context, evt *events.Message, chatJID string, act protoAction) bool {
+	switch act.Kind {
+	case actionDrop:
+		b.logger.Infof("Ignoring %s: %s", evt.Info.ID, act.Reason)
+		return true
+
+	case actionEdit:
+		_, body, _ := classifyMessage(act.Edited)
+		found, err := b.store.ApplyEdit(ctx, chatJID, act.TargetID, evt.Info.IsFromMe, nullString(body))
+		switch {
+		case err != nil:
+			b.logger.Warnf("ApplyEdit %s: %v", act.TargetID, err)
+		case !found:
+			// Edit of a message we never stored (older than the bridge, or
+			// sent before pairing). Nothing visible to fix.
+			b.logger.Infof("Edit for unknown message %s ignored", act.TargetID)
+		default:
+			if err := b.store.RecomputeChatTail(ctx, chatJID); err != nil {
+				b.logger.Warnf("RecomputeChatTail %s: %v", chatJID, err)
+			}
+		}
+		return true
+
+	case actionRevoke:
+		found, err := b.store.RevokeMessage(ctx, chatJID, act.TargetID)
+		if err != nil {
+			b.logger.Warnf("RevokeMessage %s: %v", act.TargetID, err)
+			return true
+		}
+		if !found {
+			// Original not stored: keep the old behaviour (a 'revoked' row)
+			// so the delete is still visible in the thread.
+			return false
+		}
+		if err := b.store.RecomputeChatTail(ctx, chatJID); err != nil {
+			b.logger.Warnf("RecomputeChatTail %s: %v", chatJID, err)
+		}
+		return true
+	}
+	return false
+}
+
+// storeReaction writes a reaction (or its removal) without touching the
+// chat's last-message tail or unread count. It creates no chat row: a reaction
+// in a chat we have no messages for has nothing to attach to, and the
+// INSERT IGNORE in the store drops it on the foreign key.
+func (b *Bridge) storeReaction(ctx context.Context, evt *events.Message, chatJID string, rm *waProto.ReactionMessage) {
+	if rm.GetKey().GetID() == "" {
+		return
+	}
+	if err := b.store.UpsertReaction(ctx, reactionRecord(evt.Info, chatJID, rm)); err != nil {
+		b.logger.Warnf("UpsertReaction %s: %v", evt.Info.ID, err)
 	}
 }
 
@@ -600,6 +719,17 @@ func (b *Bridge) handleReceipt(evt *events.Receipt) {
 	if len(evt.MessageIDs) == 0 {
 		return
 	}
+	// The staff read the chat on the phone or WhatsApp Web: it is no longer
+	// unread here either.
+	if isSelfRead(evt) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		chatJID := b.canonicalChatJID(ctx, evt.Chat).String()
+		if err := b.store.ClearUnread(ctx, chatJID); err != nil {
+			b.logger.Warnf("ClearUnread %s: %v", chatJID, err)
+		}
+		return
+	}
 	var newStatus string
 	switch evt.Type {
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf, types.ReceiptTypePlayed:
@@ -621,6 +751,11 @@ func (b *Bridge) handleReceipt(evt *events.Receipt) {
 	if err := b.store.MarkMessagesStatus(ctx, ids, newStatus); err != nil {
 		b.logger.Warnf("MarkMessagesStatus (%s, %d ids): %v", newStatus, len(ids), err)
 	}
+}
+
+// isSelfRead reports a read receipt from one of our own devices.
+func isSelfRead(evt *events.Receipt) bool {
+	return evt.IsFromMe && (evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf)
 }
 
 // resolvePNForLID returns the phone-number JID associated with an @lid
@@ -754,24 +889,11 @@ func (b *Bridge) fetchProfilePicURL(ctx context.Context, jid types.JID) sql.Null
 //   - EphemeralMessage: disappearing messages.
 //   - ViewOnceMessage / ViewOnceMessageV2: "view once" media.
 //   - DocumentWithCaptionMessage: documents that carry a caption.
+//
 // Without unwrapping, the outer envelope has none of the leaf accessors
 // set and we'd misclassify the whole thing as "other".
 func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
-	if dsm := msg.GetDeviceSentMessage(); dsm != nil && dsm.GetMessage() != nil {
-		return classifyMessage(dsm.GetMessage())
-	}
-	if eph := msg.GetEphemeralMessage(); eph != nil && eph.GetMessage() != nil {
-		return classifyMessage(eph.GetMessage())
-	}
-	if vom := msg.GetViewOnceMessage(); vom != nil && vom.GetMessage() != nil {
-		return classifyMessage(vom.GetMessage())
-	}
-	if vom := msg.GetViewOnceMessageV2(); vom != nil && vom.GetMessage() != nil {
-		return classifyMessage(vom.GetMessage())
-	}
-	if dwc := msg.GetDocumentWithCaptionMessage(); dwc != nil && dwc.GetMessage() != nil {
-		return classifyMessage(dwc.GetMessage())
-	}
+	msg = unwrapMessage(msg)
 
 	switch {
 	case msg.GetConversation() != "":
@@ -813,9 +935,8 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 		return "contact", msg.GetContactMessage().GetDisplayName(), nil
 	case msg.GetReactionMessage() != nil:
 		return "reaction", msg.GetReactionMessage().GetText(), nil
-	case msg.GetProtocolMessage() != nil &&
-		msg.GetProtocolMessage().GetType() == waProto.ProtocolMessage_REVOKE:
-		return "revoked", "", nil
+	case msg.GetProtocolMessage() != nil:
+		return classifyProtocol(msg.GetProtocolMessage().GetType())
 
 	// Rich / interactive types that aren't strictly media — keep
 	// message_type='other' but populate body with an informative label so
@@ -834,6 +955,14 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 	// Not user-facing content, just a side effect of group / sender-key
 	// setup that whatsmeow surfaces alongside real messages.
 	case msg.GetSenderKeyDistributionMessage() != nil:
+		return "system", "", nil
+	// An album header only announces how many photos follow; each photo
+	// arrives as its own associatedChildMessage and is classified on its own.
+	case msg.GetAlbumMessage() != nil:
+		return "system", "", nil
+	// Encrypted edits / reactions that the live path could not decrypt (or
+	// that arrive through history sync): nothing to show.
+	case msg.GetSecretEncryptedMessage() != nil, msg.GetEncReactionMessage() != nil:
 		return "system", "", nil
 	case msg.GetButtonsMessage() != nil:
 		content := strings.TrimSpace(msg.GetButtonsMessage().GetContentText())
@@ -869,6 +998,44 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 		}
 		return "other", "", nil
 	}
+}
+
+// classifyProtocol maps the ProtocolMessage subtypes that are not edits or
+// deletes. Plumbing (ephemeral settings, history-sync notifications, key
+// shares, app state, peer data, LID migration, ...) is 'system' and never
+// stored. Anything else stays 'other' but names its subtype in the body so
+// the logs and the DB show what it was; the web UI hides such rows.
+func classifyProtocol(t waProto.ProtocolMessage_Type) (string, string, *mediaDescriptor) {
+	switch t {
+	case waProto.ProtocolMessage_REVOKE:
+		return "revoked", "", nil
+	case waProto.ProtocolMessage_MESSAGE_EDIT,
+		waProto.ProtocolMessage_EPHEMERAL_SETTING,
+		waProto.ProtocolMessage_EPHEMERAL_SYNC_RESPONSE,
+		waProto.ProtocolMessage_HISTORY_SYNC_NOTIFICATION,
+		waProto.ProtocolMessage_APP_STATE_SYNC_KEY_SHARE,
+		waProto.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST,
+		waProto.ProtocolMessage_MSG_FANOUT_BACKFILL_REQUEST,
+		waProto.ProtocolMessage_INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC,
+		waProto.ProtocolMessage_APP_STATE_FATAL_EXCEPTION_NOTIFICATION,
+		waProto.ProtocolMessage_SHARE_PHONE_NUMBER,
+		waProto.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_MESSAGE,
+		waProto.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE,
+		waProto.ProtocolMessage_REQUEST_WELCOME_MESSAGE,
+		waProto.ProtocolMessage_MEDIA_NOTIFY_MESSAGE,
+		waProto.ProtocolMessage_CLOUD_API_THREAD_CONTROL_NOTIFICATION,
+		waProto.ProtocolMessage_LID_MIGRATION_MAPPING_SYNC,
+		waProto.ProtocolMessage_LIMIT_SHARING,
+		waProto.ProtocolMessage_GROUP_MEMBER_LABEL_CHANGE,
+		waProto.ProtocolMessage_MESSAGE_UNSCHEDULE,
+		waProto.ProtocolMessage_CHAT_THEME_SETTING,
+		waProto.ProtocolMessage_MARK_AS_VERIFIED_ACTION,
+		waProto.ProtocolMessage_COEX_STATE_SYNC,
+		waProto.ProtocolMessage_SHARED_DEVICE_CONTACT_HASH_KEY_SHARE,
+		waProto.ProtocolMessage_SHARED_DEVICE_CONTACT_HASH_KEY_REQUEST:
+		return "system", "", nil
+	}
+	return "other", "[proto: protocolMessage/" + t.String() + "]", nil
 }
 
 // setProtoFields returns the names of fields populated on a proto Message
@@ -993,11 +1160,13 @@ func defaultStatus(fromMe bool) string {
 	return "received"
 }
 
+// truncate shortens s to n characters (not bytes: cutting inside a UTF-8
+// sequence makes MySQL reject the whole insert) and appends an ellipsis.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string([]rune(s)[:n]) + "…"
 }
 
 func nullString(s string) sql.NullString {
@@ -1167,6 +1336,9 @@ type outboundRow struct {
 	MediaSize       sql.NullInt64
 	MediaSHA256     sql.NullString
 	Attempts        int
+	// QuotedMessageID is the reply target of a text/media row, and the
+	// reacted-to message of kind='reaction'.
+	QuotedMessageID sql.NullString
 }
 
 // Cap on retries before we permanently mark a row 'failed'. Tuned with
@@ -1175,14 +1347,38 @@ type outboundRow struct {
 const outboundMaxAttempts = 5
 
 func (b *Bridge) processOutboundBatch(ctx context.Context) error {
+	var batch []outboundRow
+	// Without the quoted_message_id column (migration not applied yet) the
+	// bridge keeps working with the legacy column list: no replies/reactions.
+	err := b.store.Fallback("wa_outbound.quoted_message_id", func() (err error) {
+		batch, err = b.queryPendingOutbound(ctx, true)
+		return err
+	}, func() (err error) {
+		batch, err = b.queryPendingOutbound(ctx, false)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	for _, r := range batch {
+		b.sendOutboundRow(ctx, r)
+	}
+	return nil
+}
+
+func (b *Bridge) queryPendingOutbound(ctx context.Context, withQuote bool) ([]outboundRow, error) {
 	// The CASE expression mirrors the per-attempt backoff: a row that's
 	// failed N times waits backoffForAttempt(N) seconds before its next
 	// SELECT picks it up. Bare 0 for attempts=0 makes brand-new rows
 	// process immediately.
+	quoteCol := "NULL"
+	if withQuote {
+		quoteCol = "quoted_message_id"
+	}
 	rows, err := b.store.DB().QueryContext(ctx, `
 		SELECT id, client_request_id, chat_jid, body, kind,
 		       media_url, media_mime, media_filename, media_size, media_sha256,
-		       attempts
+		       attempts, `+quoteCol+`
 		FROM wa_outbound
 		WHERE status = 'pending'
 		  AND attempts < ?
@@ -1200,27 +1396,22 @@ func (b *Bridge) processOutboundBatch(ctx context.Context) error {
 		LIMIT 10
 	`, outboundMaxAttempts)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	defer rows.Close()
 	var batch []outboundRow
 	for rows.Next() {
 		var r outboundRow
 		if err := rows.Scan(
 			&r.ID, &r.ClientRequestID, &r.ChatJID, &r.Body, &r.Kind,
 			&r.MediaURL, &r.MediaMime, &r.MediaFilename, &r.MediaSize, &r.MediaSHA256,
-			&r.Attempts,
+			&r.Attempts, &r.QuotedMessageID,
 		); err != nil {
-			rows.Close()
-			return err
+			return nil, err
 		}
 		batch = append(batch, r)
 	}
-	rows.Close()
-
-	for _, r := range batch {
-		b.sendOutboundRow(ctx, r)
-	}
-	return nil
+	return batch, rows.Err()
 }
 
 func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
@@ -1236,6 +1427,23 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	// the matching inbound through LID.
 	storeChatJID := b.canonicalChatJID(ctx, chatJID).String()
 
+	if r.Kind == "reaction" {
+		b.sendReactionRow(ctx, r, chatJID, storeChatJID)
+		return
+	}
+
+	// Reply target: look the quoted row up first (cheap) so a transient DB
+	// error retries before any media is uploaded.
+	var quote *outboundQuote
+	if r.QuotedMessageID.Valid && r.QuotedMessageID.String != "" {
+		q, err := b.lookupQuote(ctx, r, chatJID, storeChatJID)
+		if err != nil {
+			b.markOutboundAttempt(ctx, r, "quote lookup: "+err.Error())
+			return
+		}
+		quote = q
+	}
+
 	msg, msgType, thumbURL, sendErr := b.buildOutboundMessage(ctx, r)
 	if sendErr != nil {
 		// buildOutboundMessage marks permanent failures itself for bad
@@ -1246,6 +1454,10 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 			b.markOutboundAttempt(ctx, r, sendErr.Error())
 		}
 		return
+	}
+
+	if quote != nil {
+		msg = attachQuote(msg, quote.ctxInfo)
 	}
 
 	resp, err := b.client.SendMessage(ctx, chatJID, msg)
@@ -1275,21 +1487,26 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	// Media metadata is the public URL the PHP gateway already stored —
 	// not the WhatsApp CDN URL, which is encrypted and useless to the UI.
 	msgRow := store.Message{
-		ID:              resp.ID,
-		ChatJID:         storeChatJID,
-		SenderJID:       nullString(b.selfJID()),
-		FromMe:          true,
-		MessageType:     msgType,
-		Body:            nullString(r.Body),
-		MediaURL:        r.MediaURL,
-		MediaMime:       r.MediaMime,
-		MediaSize:       r.MediaSize,
-		MediaFilename:   r.MediaFilename,
-		MediaSHA256:     r.MediaSHA256,
+		ID:                resp.ID,
+		ChatJID:           storeChatJID,
+		SenderJID:         nullString(b.selfJID()),
+		FromMe:            true,
+		MessageType:       msgType,
+		Body:              nullString(r.Body),
+		MediaURL:          r.MediaURL,
+		MediaMime:         r.MediaMime,
+		MediaSize:         r.MediaSize,
+		MediaFilename:     r.MediaFilename,
+		MediaSHA256:       r.MediaSHA256,
 		MediaThumbnailURL: thumbURL,
-		ClientRequestID: nullString(r.ClientRequestID),
-		Timestamp:       resp.Timestamp,
-		Status:          sql.NullString{String: "sent", Valid: true},
+		ClientRequestID:   nullString(r.ClientRequestID),
+		Timestamp:         resp.Timestamp,
+		Status:            sql.NullString{String: "sent", Valid: true},
+	}
+	if quote != nil {
+		msgRow.QuotedMessageID = nullString(r.QuotedMessageID.String)
+		msgRow.QuotedPreview = nullString(quote.preview)
+		msgRow.QuotedSenderJID = nullString(quote.senderJID)
 	}
 	if err := b.store.InsertMessage(ctx, msgRow); err != nil {
 		b.logger.Warnf("Insert outbound wa_messages %s: %v", resp.ID, err)
@@ -1312,6 +1529,114 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	}
 
 	b.logger.Infof("Sent outbound %d (%s, %s) -> %s", r.ID, resp.ID, msgType, storeChatJID)
+}
+
+// outboundQuote is a resolved reply target.
+type outboundQuote struct {
+	ctxInfo   *waProto.ContextInfo
+	preview   string // stored in wa_messages.quoted_preview
+	senderJID string // stored in wa_messages.quoted_sender_jid
+}
+
+// lookupQuote resolves the message a reply points at. A target that is not
+// in the table (or whose author we cannot name in a group) is not an error:
+// the message goes out as a plain one and the reason is logged.
+func (b *Bridge) lookupQuote(ctx context.Context, r outboundRow, chatJID types.JID, storeChatJID string) (*outboundQuote, error) {
+	row, found, err := b.findMessageRow(ctx, r, storeChatJID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		b.logger.Infof("Outbound %d: quoted message %s not found, sending without quote", r.ID, r.QuotedMessageID.String)
+		return nil, nil
+	}
+	participant := participantFor(row, chatJID, b.ownPN(), b.ownLID())
+	if participant.IsEmpty() {
+		b.logger.Infof("Outbound %d: author of quoted message %s unknown, sending without quote", r.ID, r.QuotedMessageID.String)
+		return nil, nil
+	}
+	return &outboundQuote{
+		ctxInfo:   buildQuoteContext(r.QuotedMessageID.String, participant, row),
+		preview:   truncateRunes(quoteLabel(row.MessageType, row.Body.String, row.MediaFilename.String), quotedPreviewMax),
+		senderJID: participant.String(),
+	}, nil
+}
+
+// findMessageRow loads the row an outbound reply / reaction targets. The
+// PHP gateway validated the id against the chat_jid it queued, so that key
+// goes first; the canonical key covers a LID/PN rewrite.
+func (b *Bridge) findMessageRow(ctx context.Context, r outboundRow, storeChatJID string) (store.QuotedRow, bool, error) {
+	id := r.QuotedMessageID.String
+	row, found, err := b.store.GetQuotedRow(ctx, r.ChatJID, id)
+	if err != nil || found || storeChatJID == r.ChatJID {
+		return row, found, err
+	}
+	return b.store.GetQuotedRow(ctx, storeChatJID, id)
+}
+
+// sendReactionRow sends a reaction (kind='reaction': body = the emoji, empty
+// body = remove, quoted_message_id = the reacted-to message) and records the
+// reaction row, replacing our previous one on that message.
+func (b *Bridge) sendReactionRow(ctx context.Context, r outboundRow, chatJID types.JID, storeChatJID string) {
+	if !r.QuotedMessageID.Valid || r.QuotedMessageID.String == "" {
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "reaction without a target message")
+		return
+	}
+	row, found, err := b.findMessageRow(ctx, r, storeChatJID)
+	if err != nil {
+		b.markOutboundAttempt(ctx, r, "reaction target lookup: "+err.Error())
+		return
+	}
+	if !found {
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "reacted message not found: "+r.QuotedMessageID.String)
+		return
+	}
+	sender := participantFor(row, chatJID, b.ownPN(), b.ownLID())
+	if sender.IsEmpty() {
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "author of the reacted message is unknown")
+		return
+	}
+	msg := b.client.BuildReaction(chatJID, sender, r.QuotedMessageID.String, r.Body)
+	resp, err := b.client.SendMessage(ctx, chatJID, msg)
+	if err != nil {
+		b.markOutboundAttempt(ctx, r, err.Error())
+		return
+	}
+	if _, err := b.store.DB().ExecContext(ctx, `
+		UPDATE wa_outbound
+		SET status = 'sent',
+		    whatsapp_message_id = ?,
+		    sent_at = NOW(),
+		    error_message = NULL
+		WHERE id = ?
+	`, resp.ID, r.ID); err != nil {
+		b.logger.Warnf("Failed to mark outbound %d sent: %v", r.ID, err)
+	}
+	if err := b.store.UpsertReaction(ctx, store.Reaction{
+		ID:        resp.ID,
+		ChatJID:   storeChatJID,
+		SenderJID: nullString(b.selfJID()),
+		FromMe:    true,
+		IsGroup:   chatJID.Server == types.GroupServer,
+		TargetID:  r.QuotedMessageID.String,
+		Emoji:     r.Body,
+		Timestamp: resp.Timestamp,
+	}); err != nil {
+		b.logger.Warnf("Outbound %d: store reaction: %v", r.ID, err)
+	}
+	b.logger.Infof("Sent outbound %d (%s, reaction) -> %s", r.ID, resp.ID, storeChatJID)
+}
+
+// ownPN / ownLID are our own account JIDs without the device suffix.
+func (b *Bridge) ownPN() types.JID {
+	if b.client.Store.ID == nil {
+		return types.EmptyJID
+	}
+	return b.client.Store.ID.ToNonAD()
+}
+
+func (b *Bridge) ownLID() types.JID {
+	return b.client.Store.GetLID().ToNonAD()
 }
 
 // buildOutboundMessage materialises the proto message to send for a row,
@@ -1597,4 +1922,3 @@ func (b *Bridge) selfJID() string {
 	}
 	return b.client.Store.ID.String()
 }
-
