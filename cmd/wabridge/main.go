@@ -7,12 +7,16 @@
 //   wabridge uninstall       # remove the service
 //   wabridge start | stop    # service control
 //   wabridge version         # print the build tag baked in by CI
+//   wabridge check-number +525512345678
+//                            # ask the RUNNING bridge whether a phone has
+//                            # WhatsApp (no send, no MySQL write)
 //
 // Configuration is read from ./config.yaml relative to the binary.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -54,6 +58,25 @@ func main() {
 		}
 		cfgPath = filepath.Join(filepath.Dir(exe), "config.yaml")
 	}
+	dir := filepath.Dir(cfgPath)
+
+	// check-number talks to the running bridge through a file next to
+	// config.yaml; it needs no config of its own.
+	if flag.Arg(0) == "check-number" {
+		if flag.NArg() != 2 {
+			log.Fatalf("usage: wabridge check-number +525512345678")
+		}
+		res, err := wabridge.RequestCheckNumber(dir, flag.Arg(1), 60*time.Second)
+		if err != nil {
+			log.Fatalf("check-number: %v", err)
+		}
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+		if res.Error != "" && !res.IsIn {
+			os.Exit(1)
+		}
+		return
+	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -67,7 +90,7 @@ func main() {
 		Arguments:   []string{"run"},
 	}
 
-	prg := &program{cfg: cfg}
+	prg := &program{cfg: cfg, dir: dir}
 	svc, err := service.New(prg, svcConfig)
 	if err != nil {
 		log.Fatalf("service.New: %v", err)
@@ -80,7 +103,7 @@ func main() {
 			// and the QR-code pairing flow is visible (and are teed to the log file).
 			closeLog := startLogging(cfgPath, cfg, true)
 			defer closeLog()
-			runForeground(cfg)
+			runForeground(cfg, dir)
 			return
 		}
 		if err := service.Control(svc, cmd); err != nil {
@@ -117,6 +140,7 @@ func startLogging(cfgPath string, cfg *config.Config, tee bool) func() {
 
 type program struct {
 	cfg    *config.Config
+	dir    string // config.yaml's directory: log file and check-number files
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -127,7 +151,7 @@ func (p *program) Start(s service.Service) error {
 	p.done = make(chan struct{})
 	go func() {
 		defer close(p.done)
-		supervise(ctx, p.cfg)
+		supervise(ctx, p.cfg, p.dir)
 	}()
 	return nil
 }
@@ -145,15 +169,15 @@ func (p *program) Stop(s service.Service) error {
 	return nil
 }
 
-func runForeground(cfg *config.Config) {
+func runForeground(cfg *config.Config, dir string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	supervise(ctx, cfg)
+	supervise(ctx, cfg, dir)
 }
 
 // supervise runs one attempt per loop iteration. If the tunnel or whatsmeow
 // connection drops, we tear down and reconnect with exponential backoff.
-func supervise(ctx context.Context, cfg *config.Config) {
+func supervise(ctx context.Context, cfg *config.Config, dir string) {
 	backoff := 2 * time.Second
 	const maxBackoff = 60 * time.Second
 
@@ -163,7 +187,7 @@ func supervise(ctx context.Context, cfg *config.Config) {
 		}
 
 		started := time.Now()
-		err := runOnce(ctx, cfg)
+		err := runOnce(ctx, cfg, dir)
 		if ctx.Err() != nil {
 			return
 		}
@@ -186,7 +210,7 @@ func supervise(ctx context.Context, cfg *config.Config) {
 	}
 }
 
-func runOnce(ctx context.Context, cfg *config.Config) error {
+func runOnce(ctx context.Context, cfg *config.Config, dir string) error {
 	// Scope every watcher goroutine below to this attempt. When runOnce
 	// returns (a tunnel/whatsmeow drop), cancel() stops them all instead of
 	// leaking them onto the long-lived supervise ctx — otherwise each retry
@@ -238,6 +262,9 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 
 	typingDone := make(chan error, 1)
 	go func() { typingDone <- bridge.WatchTypingOutbound(ctx) }()
+
+	// Answers `wabridge check-number`; ends with ctx, never fails on its own.
+	go func() { _ = bridge.WatchCheckRequests(ctx, dir) }()
 
 	select {
 	case <-ctx.Done():

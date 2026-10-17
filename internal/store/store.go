@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/enviadores/wabridge/internal/config"
 	"github.com/go-sql-driver/mysql"
@@ -732,13 +733,111 @@ func (s *Store) ClearUnreadUpTo(ctx context.Context, chatJID string, readIDs []s
 	return err
 }
 
+// BridgeFeatures is the comma list the heartbeat writes to
+// wa_pairing.bridge_features. The web app enables a feature only while a
+// bridge that has it is heartbeating, so a rolled-back bridge (which stamps
+// last_seen_at without this column) switches it off within minutes. Later
+// features append to it ("new_chat,foo").
+const BridgeFeatures = "new_chat"
+
+// featureBridgeFeatures names the Fallback feature for
+// wa_pairing.bridge_features / bridge_features_at.
+const featureBridgeFeatures = "wa_pairing.bridge_features"
+
 // Heartbeat stamps wa_pairing.last_seen_at so the web app can tell a live
-// bridge from a dead one. Missing column: logged once, then skipped.
+// bridge from a dead one, and in the same UPDATE announces BridgeFeatures.
+// Without the features columns it stamps last_seen_at alone; without that
+// column too, it logs once and skips.
 func (s *Store) Heartbeat(ctx context.Context) error {
-	return s.Fallback(featureHeartbeat, func() error {
-		_, err := s.db.ExecContext(ctx, `UPDATE wa_pairing SET last_seen_at = NOW() WHERE id = 1`)
+	return s.Fallback(featureBridgeFeatures, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE wa_pairing
+			SET last_seen_at = UTC_TIMESTAMP(),
+			    bridge_features = ?,
+			    bridge_features_at = UTC_TIMESTAMP()
+			WHERE id = 1`, BridgeFeatures)
 		return err
-	}, nil)
+	}, func() error {
+		return s.Fallback(featureHeartbeat, func() error {
+			_, err := s.db.ExecContext(ctx, `UPDATE wa_pairing SET last_seen_at = UTC_TIMESTAMP() WHERE id = 1`)
+			return err
+		}, nil)
+	})
+}
+
+// featureErrorCode names the Fallback feature for wa_outbound.error_code.
+const featureErrorCode = "wa_outbound.error_code"
+
+// outboundMessageMax is the longest error_message the bridge writes.
+const outboundMessageMax = 500
+
+// FailOutbound marks a wa_outbound row permanently failed. code is the
+// machine reason (NOT_ON_WHATSAPP, INVALID_PHONE, SEND_FAILED, ...) written
+// to error_code; error_message is always "<code>: <detail>", so the web app
+// can read the code even from a row written against a schema without the
+// column (the legacy statement then runs instead).
+func (s *Store) FailOutbound(ctx context.Context, id int64, attempts int, code, detail string) error {
+	msg := clip(code+": "+detail, outboundMessageMax)
+	return s.Fallback(featureErrorCode, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE wa_outbound
+			SET status = 'failed',
+			    attempts = ?,
+			    last_attempt_at = UTC_TIMESTAMP(),
+			    error_message = ?,
+			    error_code = ?
+			WHERE id = ?`, attempts, msg, code, id)
+		return err
+	}, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE wa_outbound
+			SET status = 'failed',
+			    attempts = ?,
+			    last_attempt_at = UTC_TIMESTAMP(),
+			    error_message = ?
+			WHERE id = ?`, attempts, msg, id)
+		return err
+	})
+}
+
+// MarkNewChatSent stamps a new-chat row (status='resolve') as sent. chatJID
+// is the wa_chats key the message was stored under, or NULL when the chat
+// row could not be written (the FK forbids pointing at a missing chat; the
+// customer's reply or a receipt creates it later).
+func (s *Store) MarkNewChatSent(ctx context.Context, id int64, chatJID sql.NullString, waMessageID string) error {
+	return s.Fallback(featureErrorCode, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE wa_outbound
+			SET status = 'sent',
+			    chat_jid = ?,
+			    whatsapp_message_id = ?,
+			    sent_at = UTC_TIMESTAMP(),
+			    error_message = NULL,
+			    error_code = NULL
+			WHERE id = ?`, chatJID, waMessageID, id)
+		return err
+	}, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE wa_outbound
+			SET status = 'sent',
+			    chat_jid = ?,
+			    whatsapp_message_id = ?,
+			    sent_at = UTC_TIMESTAMP(),
+			    error_message = NULL
+			WHERE id = ?`, chatJID, waMessageID, id)
+		return err
+	})
+}
+
+// clip cuts s to at most n bytes without splitting a UTF-8 sequence.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // MarkMessagesStatus updates wa_messages.status for the given IDs, but

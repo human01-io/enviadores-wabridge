@@ -40,6 +40,16 @@ type Bridge struct {
 	// Decryption entry points, fields so tests can stub them.
 	decryptSecret   secretDecryptor
 	decryptReaction func(context.Context, *events.Message) (*waProto.ReactionMessage, error)
+
+	// WhatsApp calls of the new-chat path, fields so tests can stub them.
+	isOnWhatsApp func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error)
+	sendMessage  func(context.Context, types.JID, *waProto.Message, ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	lidForPN     func(context.Context, types.JID) (types.JID, error)
+	now          func() time.Time
+
+	// newChat is the pacing and resend guard of processNewChats. Only the
+	// WatchOutbound goroutine touches it.
+	newChat newChatState
 }
 
 func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Uploader) (*Bridge, error) {
@@ -76,6 +86,9 @@ func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Upl
 	}
 	b.decryptSecret = client.DecryptSecretEncryptedMessage
 	b.decryptReaction = client.DecryptReaction
+	b.isOnWhatsApp = client.IsOnWhatsApp
+	b.sendMessage = client.SendMessage
+	b.lidForPN = client.Store.LIDs.GetLIDForPN
 	st.SetLogger(func(format string, args ...any) { clientLog.Warnf(format, args...) })
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -964,7 +977,11 @@ func (b *Bridge) canonicalChatJID(ctx context.Context, raw types.JID) types.JID 
 	if raw.Server != types.DefaultUserServer || raw.User == "" {
 		return raw
 	}
-	lid, err := b.client.Store.LIDs.GetLIDForPN(ctx, raw)
+	lookup := b.lidForPN
+	if lookup == nil {
+		lookup = b.client.Store.LIDs.GetLIDForPN
+	}
+	lid, err := lookup(ctx, raw)
 	if err != nil || lid.IsEmpty() || lid.User == "" {
 		return raw
 	}
@@ -976,6 +993,9 @@ func (b *Bridge) canonicalChatJID(ctx context.Context, raw types.JID) types.JID 
 // first name → business name → push name. Returns "" when nothing is
 // known.
 func (b *Bridge) contactNameForJID(ctx context.Context, jid types.JID) string {
+	if b.client == nil || jid.IsEmpty() {
+		return ""
+	}
 	c, err := b.client.Store.Contacts.GetContact(ctx, jid)
 	if err != nil || !c.Found {
 		return ""
@@ -1516,6 +1536,21 @@ type outboundRow struct {
 	QuotedMessageID sql.NullString
 }
 
+// outboundBackoffSQL is the WHERE clause that holds a row back after N
+// failed attempts for the per-attempt backoff (bare 0 for attempts=0, so
+// brand-new rows go out immediately). Shared by the pending and the
+// new-chat (status='resolve') queries.
+const outboundBackoffSQL = `(
+		    last_attempt_at IS NULL
+		    OR last_attempt_at < (UTC_TIMESTAMP() - INTERVAL (CASE attempts
+		        WHEN 0 THEN 0
+		        WHEN 1 THEN 10
+		        WHEN 2 THEN 30
+		        WHEN 3 THEN 60
+		        WHEN 4 THEN 120
+		        ELSE 300 END) SECOND)
+		  )`
+
 // Cap on retries before we permanently mark a row 'failed'. Tuned with
 // the backoff schedule below to ~9 minutes of total elapsed time before
 // giving up (10 + 30 + 60 + 120 + 300 ≈ 520s).
@@ -1538,6 +1573,9 @@ func (b *Bridge) processOutboundBatch(ctx context.Context) error {
 	for _, r := range batch {
 		b.sendOutboundRow(ctx, r)
 	}
+	// New chats by phone (status='resolve') after the existing-chat rows:
+	// at most one per tick, paced by newChatMinGap.
+	b.processNewChats(ctx)
 	return nil
 }
 
@@ -1557,16 +1595,7 @@ func (b *Bridge) queryPendingOutbound(ctx context.Context, withQuote bool) ([]ou
 		FROM wa_outbound
 		WHERE status = 'pending'
 		  AND attempts < ?
-		  AND (
-		    last_attempt_at IS NULL
-		    OR last_attempt_at < (UTC_TIMESTAMP() - INTERVAL (CASE attempts
-		        WHEN 0 THEN 0
-		        WHEN 1 THEN 10
-		        WHEN 2 THEN 30
-		        WHEN 3 THEN 60
-		        WHEN 4 THEN 120
-		        ELSE 300 END) SECOND)
-		  )
+		  AND `+outboundBackoffSQL+`
 		ORDER BY id
 		LIMIT 10
 	`, outboundMaxAttempts)
@@ -1593,7 +1622,7 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 	chatJID, err := types.ParseJID(r.ChatJID)
 	if err != nil {
 		// Bad JID is not a transient error — no point retrying.
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "invalid chat_jid: "+err.Error())
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "INVALID_JID", "invalid chat_jid: "+err.Error())
 		return
 	}
 
@@ -1760,7 +1789,7 @@ func (b *Bridge) findMessageRow(ctx context.Context, r outboundRow, storeChatJID
 // reaction row, replacing our previous one on that message.
 func (b *Bridge) sendReactionRow(ctx context.Context, r outboundRow, chatJID types.JID, storeChatJID string) {
 	if !r.QuotedMessageID.Valid || r.QuotedMessageID.String == "" {
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "reaction without a target message")
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "REACTION_TARGET", "reaction without a target message")
 		return
 	}
 	row, found, err := b.findMessageRow(ctx, r, storeChatJID)
@@ -1769,16 +1798,16 @@ func (b *Bridge) sendReactionRow(ctx context.Context, r outboundRow, chatJID typ
 		return
 	}
 	if !found {
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "reacted message not found: "+r.QuotedMessageID.String)
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "REACTION_TARGET", "reacted message not found: "+r.QuotedMessageID.String)
 		return
 	}
 	if !row.Quotable() {
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "reacted message was deleted or cannot take a reaction: "+r.QuotedMessageID.String)
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "REACTION_TARGET", "reacted message was deleted or cannot take a reaction: "+r.QuotedMessageID.String)
 		return
 	}
 	sender := participantFor(row, chatJID, b.ownPN(), b.ownLID())
 	if sender.IsEmpty() {
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "author of the reacted message is unknown")
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "REACTION_TARGET", "author of the reacted message is unknown")
 		return
 	}
 	msg := b.client.BuildReaction(chatJID, sender, r.QuotedMessageID.String, r.Body)
@@ -1845,17 +1874,17 @@ func (b *Bridge) buildOutboundMessage(ctx context.Context, r outboundRow) (*waPr
 
 	mediaType, ok := mediaTypeForKind(kind)
 	if !ok {
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "unsupported kind: "+kind)
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "UNSUPPORTED_KIND", "unsupported kind: "+kind)
 		return nil, "", thumbURL, fmt.Errorf("unsupported kind %q: %w", kind, errOutboundPermanent)
 	}
 	if !r.MediaURL.Valid || r.MediaURL.String == "" {
-		b.markOutboundPermanentlyFailed(ctx, r.ID, "media row missing media_url")
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "MEDIA", "media row missing media_url")
 		return nil, "", thumbURL, fmt.Errorf("media row missing media_url: %w", errOutboundPermanent)
 	}
 
 	basename := b.uploader.BasenameFromPublicURL(r.MediaURL.String)
 	if basename == "" {
-		b.markOutboundPermanentlyFailed(ctx, r.ID,
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "MEDIA",
 			"media_url path is not under public_base_url ("+b.cfg.Media.PublicBaseURL+"): "+r.MediaURL.String)
 		return nil, "", thumbURL, fmt.Errorf("media_url %q is not under the configured public base: %w", r.MediaURL.String, errOutboundPermanent)
 	}
@@ -2040,27 +2069,28 @@ func previewForKind(kind, filename string) string {
 }
 
 // markOutboundAttempt records a send failure and, if the attempts cap has
-// been reached, transitions the row to status='failed'. Otherwise the row
-// stays 'pending' and the next processOutboundBatch tick (after the
-// per-attempt backoff window) will retry it.
+// been reached, transitions the row to status='failed' (error_code
+// SEND_FAILED). Otherwise the row keeps its status and the next
+// processOutboundBatch tick (after the per-attempt backoff window) will
+// retry it.
 func (b *Bridge) markOutboundAttempt(ctx context.Context, r outboundRow, msg string) {
+	b.markAttempt(ctx, r.ID, r.Attempts, codeSendFailed, msg)
+}
+
+// markAttempt is markOutboundAttempt for any row: id, its attempts so far,
+// and the error_code to write when this attempt reaches the cap. It never
+// touches the status below the cap, so a 'resolve' row stays 'resolve'.
+func (b *Bridge) markAttempt(ctx context.Context, id int64, attempts int, capCode, msg string) {
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
-	nextAttempts := r.Attempts + 1
+	nextAttempts := attempts + 1
 	if nextAttempts >= outboundMaxAttempts {
-		if _, err := b.store.DB().ExecContext(ctx, `
-			UPDATE wa_outbound
-			SET status = 'failed',
-			    attempts = ?,
-			    last_attempt_at = UTC_TIMESTAMP(),
-			    error_message = ?
-			WHERE id = ?
-		`, nextAttempts, msg, r.ID); err != nil {
-			b.logger.Warnf("Failed to mark outbound %d failed: %v", r.ID, err)
+		if err := b.store.FailOutbound(ctx, id, nextAttempts, capCode, msg); err != nil {
+			b.logger.Warnf("Failed to mark outbound %d failed: %v", id, err)
 			return
 		}
-		b.logger.Warnf("Outbound %d permanently failed after %d attempts: %s", r.ID, nextAttempts, msg)
+		b.logger.Warnf("Outbound %d permanently failed after %d attempts (%s): %s", id, nextAttempts, capCode, msg)
 		return
 	}
 	if _, err := b.store.DB().ExecContext(ctx, `
@@ -2069,40 +2099,31 @@ func (b *Bridge) markOutboundAttempt(ctx context.Context, r outboundRow, msg str
 		    last_attempt_at = UTC_TIMESTAMP(),
 		    error_message = ?
 		WHERE id = ?
-	`, nextAttempts, msg, r.ID); err != nil {
-		b.logger.Warnf("Failed to bump attempts on outbound %d: %v", r.ID, err)
+	`, nextAttempts, msg, id); err != nil {
+		b.logger.Warnf("Failed to bump attempts on outbound %d: %v", id, err)
 		return
 	}
-	b.logger.Infof("Outbound %d attempt %d/%d failed: %s - will retry", r.ID, nextAttempts, outboundMaxAttempts, msg)
+	b.logger.Infof("Outbound %d attempt %d/%d failed: %s - will retry", id, nextAttempts, outboundMaxAttempts, msg)
 }
 
-// markOutboundPermanentlyFailed terminates retries immediately. Use for
-// errors that won't fix themselves on the next try (bad JID, etc.).
 // errOutboundPermanent marks an outbound failure that markOutboundPermanentlyFailed
 // has already recorded, so the caller doesn't overwrite it with a retry attempt.
 var errOutboundPermanent = errors.New("outbound permanently failed")
 
-func (b *Bridge) markOutboundPermanentlyFailed(ctx context.Context, id int64, msg string) {
-	if len(msg) > 500 {
-		msg = msg[:500]
-	}
+// markOutboundPermanentlyFailed terminates retries immediately. Use for
+// errors that won't fix themselves on the next try (bad JID, etc.). code is
+// the machine reason written to error_code (and as the error_message prefix).
+func (b *Bridge) markOutboundPermanentlyFailed(ctx context.Context, id int64, code, msg string) {
 	// Loud on purpose: a permanent failure means an attachment silently never
 	// reaches the customer, and the web UI never re-reads the row to notice.
-	b.logger.Errorf("Outbound %d permanently failed: %s", id, msg)
-	if _, err := b.store.DB().ExecContext(ctx, `
-		UPDATE wa_outbound
-		SET status = 'failed',
-		    attempts = ?,
-		    last_attempt_at = UTC_TIMESTAMP(),
-		    error_message = ?
-		WHERE id = ?
-	`, outboundMaxAttempts, msg, id); err != nil {
+	b.logger.Errorf("Outbound %d permanently failed (%s): %s", id, code, msg)
+	if err := b.store.FailOutbound(ctx, id, outboundMaxAttempts, code, msg); err != nil {
 		b.logger.Warnf("Failed to mark outbound %d permanently failed: %v", id, err)
 	}
 }
 
 func (b *Bridge) selfJID() string {
-	if b.client.Store.ID == nil {
+	if b.client == nil || b.client.Store.ID == nil {
 		return ""
 	}
 	return b.client.Store.ID.String()

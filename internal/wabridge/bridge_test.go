@@ -345,7 +345,8 @@ func TestProcessOutboundBatchFallsBackWithoutQuotedColumn(t *testing.T) {
 			t.Fatalf("poll %d: %v", i, err)
 		}
 	}
-	all := db.Calls()
+	// The new-chat query is its own feature; count the pending poll only.
+	all := calls(db, "status = 'pending'")
 	if len(all) != 3 { // new (fails), legacy, legacy
 		t.Fatalf("expected 3 statements, got %d: %+v", len(all), all)
 	}
@@ -357,7 +358,7 @@ func TestProcessOutboundBatchFallsBackWithoutQuotedColumn(t *testing.T) {
 func TestProcessOutboundBatchReadsQuotedMessageID(t *testing.T) {
 	var seen string
 	b, _ := newTestBridge(func(c testdb.Call) testdb.Result {
-		if c.IsQuery && strings.Contains(c.Query, "FROM wa_outbound") {
+		if c.IsQuery && strings.Contains(c.Query, "FROM wa_outbound WHERE status = 'pending'") {
 			seen = c.Query
 		}
 		return testdb.Result{}
