@@ -98,24 +98,41 @@ with the old statements.
 - **Edits** (`ProtocolMessage` MESSAGE_EDIT, also the encrypted
   `SecretEncryptedMessage` form) rewrite the original row: `original_body`
   keeps the text from before the first edit, `body` is the new text,
-  `edited_at` is stamped. No new row. An edit of a message the bridge never
-  stored, or one whose secret is gone, is ignored (logged at info).
+  `edited_at` is stamped. No new row. Only the author's edits apply. An edit
+  of a message the bridge never stored, or one whose secret is gone, is
+  ignored (logged at info). On a schema without the edit columns the new text
+  is stored as a row of its own and the original is left as it was.
 - **Deletes for everyone** set `revoked_at` on the original (the body stays for
-  audit; the PHP API hides it). If the original is not stored, a `revoked` row
-  is inserted as before.
+  audit; the PHP API hides it). In a 1:1 chat only the author can delete; in a
+  group an admin may delete anyone's message. If the original is not stored,
+  a `revoked` row is inserted as before.
+- **Finding the original**: edits, deletes and reactions look the target up by
+  its id across every form the chat may be stored under (the canonical LID,
+  the raw JID, and the phone JID of a LID chat), because a message stored
+  before the chat's LID mapping was learned keeps the phone JID. Edit and
+  delete writes are retried 3 times with fresh 20 s deadlines (the event is
+  never re-delivered); a failure after that is logged at error level.
+- **Chat preview** after an edit or delete is rebuilt with the live path's
+  labels (a caption-less photo stays "Imagen", a deleted tail is "Mensaje
+  eliminado").
 - **Reactions** are stored as `message_type='reaction'` rows with
-  `target_message_id`. One per sender per message: a new emoji replaces the
-  old one, an empty one removes it. They never change the chat's preview,
-  order or unread count; the reacted-to message gets its `status_updated_at`
-  bumped so the web client refreshes it.
+  `target_message_id`, in the chat row of the message they target. One per
+  sender per message: a new emoji replaces the old one, an empty one removes
+  it. In groups the sender is matched without its device suffix and in both
+  phone and LID form. They never change the chat's preview, order or unread
+  count; the reacted-to message gets its `status_updated_at` bumped so the web
+  client refreshes it.
 - **Replies** are read from the `ContextInfo` of every content type into
   `quoted_message_id`, `quoted_sender_jid` and `quoted_preview`. Outbound
   `wa_outbound.quoted_message_id` sends a quoted reply (text or media);
-  `kind='reaction'` sends a reaction (body = emoji, empty = remove).
+  `kind='reaction'` sends a reaction (body = emoji, empty = remove). A message
+  deleted for everyone (or a reaction/system row) is never quoted: the reply
+  goes out without the quote, and a reaction to it fails permanently.
 - **Noise**: `@bot` (Meta AI) chats and WhatsApp Status are skipped; protocol
   plumbing is never stored; album children are stored as normal images.
-- **Read sync**: a read receipt from one of our own devices zeroes the chat's
-  `unread_count`.
+- **Read sync**: a read receipt from one of our own devices marks the chat
+  read up to the newest message the receipt names; inbound messages newer
+  than that stay unread.
 - **Heartbeat**: `wa_pairing.last_seen_at` is stamped on connect and every
   30 s while connected.
 

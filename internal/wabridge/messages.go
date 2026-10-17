@@ -172,6 +172,11 @@ func reactionOf(ctx context.Context, evt *events.Message,
 	if err != nil {
 		return nil, true, err
 	}
+	// The decrypted payload usually carries only the emoji: the reacted-to
+	// message is named by the envelope's TargetMessageKey.
+	if r != nil && r.GetKey().GetID() == "" {
+		r.Key = m.GetEncReactionMessage().GetTargetMessageKey()
+	}
 	return r, true, nil
 }
 
@@ -181,13 +186,22 @@ func reactionRecord(info types.MessageInfo, chatJID string, rm *waProto.Reaction
 	return store.Reaction{
 		ID:        info.ID,
 		ChatJID:   chatJID,
-		SenderJID: nullString(info.Sender.String()),
+		SenderJID: nullString(senderNonAD(info.Sender)),
 		FromMe:    info.IsFromMe,
 		IsGroup:   info.IsGroup,
 		TargetID:  rm.GetKey().GetID(),
 		Emoji:     rm.GetText(),
 		Timestamp: info.Timestamp,
 	}
+}
+
+// senderNonAD drops the device suffix: the same member reacts from the phone
+// (device 0) and WhatsApp Web (device 12) and must match one reaction row.
+func senderNonAD(j types.JID) string {
+	if j.IsEmpty() {
+		return ""
+	}
+	return j.ToNonAD().String()
 }
 
 // ---------------------------------------------------------------------------
@@ -322,13 +336,19 @@ func quoteLabel(msgType, body, filename string) string {
 
 // participantFor picks the JID a quote or reaction names as the author of the
 // target message:
-//   - our own message: our own JID (LID form in a LID chat);
+//   - our own message: our own JID (LID form in a LID chat, and in a group
+//     where the stored row shows we were addressed by LID);
 //   - 1:1 chat: the chat's user;
 //   - group: the stored sender, empty when unknown.
 func participantFor(row store.QuotedRow, chat, ownPN, ownLID types.JID) types.JID {
 	if row.FromMe {
 		if chat.Server == types.HiddenUserServer && !ownLID.IsEmpty() {
 			return ownLID.ToNonAD()
+		}
+		if chat.Server == types.GroupServer && !ownLID.IsEmpty() && row.SenderJID.Valid {
+			if j, err := types.ParseJID(row.SenderJID.String); err == nil && j.Server == types.HiddenUserServer {
+				return ownLID.ToNonAD()
+			}
 		}
 		return ownPN.ToNonAD()
 	}

@@ -194,6 +194,15 @@ func TestReactionOfPlainAndEncrypted(t *testing.T) {
 		t.Fatalf("encrypted: %v %v %v", rm, ok, err)
 	}
 
+	// The decrypted payload usually has no Key: the envelope names the target.
+	keyless := func(context.Context, *events.Message) (*waProto.ReactionMessage, error) {
+		return &waProto.ReactionMessage{Text: proto.String("z")}, nil
+	}
+	rm, ok, err = reactionOf(context.Background(), enc, keyless)
+	if !ok || err != nil || rm.GetKey().GetID() != "T" || rm.GetText() != "z" {
+		t.Fatalf("keyless encrypted: %v %v %v", rm, ok, err)
+	}
+
 	bad := func(context.Context, *events.Message) (*waProto.ReactionMessage, error) {
 		return nil, errors.New("nope")
 	}
@@ -210,7 +219,7 @@ func TestReactionRecordCarriesTargetAndEmptyMeansRemoval(t *testing.T) {
 	info := types.MessageInfo{ID: "R1"}
 	info.IsFromMe = false
 	info.IsGroup = true
-	info.Sender = types.NewJID("5215511111111", types.DefaultUserServer)
+	info.Sender = types.JID{User: "5215511111111", Server: types.DefaultUserServer, Device: 12}
 	rec := reactionRecord(info, "chat@g.us", &waProto.ReactionMessage{Key: key("TARGET"), Text: proto.String("")})
 	if rec.TargetID != "TARGET" || rec.Emoji != "" || rec.ChatJID != "chat@g.us" || !rec.IsGroup ||
 		rec.SenderJID.String != "5215511111111@s.whatsapp.net" || rec.ID != "R1" {
@@ -363,6 +372,13 @@ func TestParticipantFor(t *testing.T) {
 	}
 	if got := participantFor(store.QuotedRow{SenderJID: nullString("not a jid@@@")}, group, ownPN, ownLID); !got.IsEmpty() {
 		t.Errorf("group with bad sender: %s", got)
+	}
+	// Our own message in a group: LID when the stored row shows LID addressing.
+	if got := participantFor(store.QuotedRow{FromMe: true, SenderJID: nullString("11111111111111:3@lid")}, group, ownPN, ownLID); got.String() != ownLID.String() {
+		t.Errorf("own in LID group: %s", got)
+	}
+	if got := participantFor(store.QuotedRow{FromMe: true, SenderJID: nullString("5215599999999:3@s.whatsapp.net")}, group, ownPN, ownLID); got.String() != ownPN.String() {
+		t.Errorf("own in PN group: %s", got)
 	}
 }
 

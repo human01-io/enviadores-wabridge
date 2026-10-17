@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -103,30 +104,55 @@ func TestInsertMessageOtherErrorsAreNotSwallowed(t *testing.T) {
 	}
 }
 
-func TestApplyEditKeepsFirstOriginalAndStampsEditedAt(t *testing.T) {
-	st, db, _ := newStore(func(c testdb.Call) testdb.Result {
-		if c.IsQuery && has(c, "SELECT 1") {
-			return testdb.Result{Cols: []string{"1"}, Rows: [][]driver.Value{{int64(1)}}}
+// locateHandler answers LocateMessage with (chat, fromMe) when chat != "".
+func locateHandler(chat string, fromMe int64, inner testdb.Handler) testdb.Handler {
+	return func(c testdb.Call) testdb.Result {
+		if c.IsQuery && has(c, "SELECT chat_jid, from_me FROM wa_messages") {
+			if chat == "" {
+				return testdb.Result{}
+			}
+			return testdb.Result{Cols: []string{"chat_jid", "from_me"}, Rows: [][]driver.Value{{chat, fromMe}}}
+		}
+		if inner != nil {
+			return inner(c)
 		}
 		return testdb.Result{}
-	})
-	found, err := st.ApplyEdit(t.Context(), "chat@lid", "MSG1", false, sql.NullString{String: "Calle Nueva 5", Valid: true})
-	if err != nil || !found {
-		t.Fatalf("ApplyEdit found=%v err=%v", found, err)
+	}
+}
+
+func TestLocateMessageSearchesEveryChatAlias(t *testing.T) {
+	st, db, _ := newStore(locateHandler("5215511111111@s.whatsapp.net", 0, nil))
+	ref, found, err := st.LocateMessage(t.Context(), "MSG1", []string{"123@lid", "5215511111111@s.whatsapp.net"})
+	if err != nil || !found || ref.ChatJID != "5215511111111@s.whatsapp.net" || ref.FromMe {
+		t.Fatalf("ref=%+v found=%v err=%v", ref, found, err)
+	}
+	c := db.Calls()[0]
+	if !has(c, "WHERE id = ? AND chat_jid IN (?,?)") || c.Args[0] != "MSG1" || c.Args[1] != "123@lid" || c.Args[2] != "5215511111111@s.whatsapp.net" {
+		t.Fatalf("unexpected locate %+v", c)
+	}
+}
+
+func TestApplyEditKeepsFirstOriginalAndStampsEditedAt(t *testing.T) {
+	// The original was stored under the phone JID before the LID mapping
+	// was learned; the edit arrives on the LID chat.
+	st, db, _ := newStore(locateHandler("5215511111111@s.whatsapp.net", 0, nil))
+	ref, found, err := st.ApplyEdit(t.Context(), []string{"123@lid", "5215511111111@s.whatsapp.net"}, "MSG1", false, sql.NullString{String: "Calle Nueva 5", Valid: true})
+	if err != nil || !found || ref.ChatJID != "5215511111111@s.whatsapp.net" {
+		t.Fatalf("ApplyEdit ref=%+v found=%v err=%v", ref, found, err)
 	}
 	calls := db.Calls()
 	if len(calls) != 2 {
-		t.Fatalf("expected UPDATE + existence check, got %+v", calls)
+		t.Fatalf("expected locate + UPDATE, got %+v", calls)
 	}
-	up := calls[0]
-	if !has(up, "UPDATE wa_messages", "original_body = COALESCE(original_body, body)", "body = ?", "edited_at = UTC_TIMESTAMP()", "WHERE id = ? AND chat_jid = ? AND from_me = ?") {
+	up := calls[1]
+	if !has(up, "UPDATE wa_messages", "original_body = COALESCE(original_body, body)", "body = ?", "edited_at = UTC_TIMESTAMP()", "WHERE id = ? AND chat_jid = ?") {
 		t.Fatalf("unexpected edit statement: %s", up.Query)
 	}
 	// original_body must be assigned before body (MySQL evaluates SET left to right).
 	if strings.Index(up.Query, "original_body = COALESCE") > strings.Index(up.Query, "body = ?") {
 		t.Fatalf("original_body must be assigned before body: %s", up.Query)
 	}
-	if up.Args[0] != "Calle Nueva 5" || up.Args[1] != "MSG1" || up.Args[2] != "chat@lid" || up.Args[3] != int64(0) {
+	if up.Args[0] != "Calle Nueva 5" || up.Args[1] != "MSG1" || up.Args[2] != "5215511111111@s.whatsapp.net" {
 		t.Fatalf("unexpected args %v", up.Args)
 	}
 	if has(up, "INSERT") {
@@ -135,30 +161,42 @@ func TestApplyEditKeepsFirstOriginalAndStampsEditedAt(t *testing.T) {
 }
 
 func TestApplyEditMissingOriginalReportsNotFound(t *testing.T) {
-	st, _, _ := newStore(nil) // existence query returns no rows
-	found, err := st.ApplyEdit(t.Context(), "chat", "GONE", true, sql.NullString{String: "x", Valid: true})
+	st, db, _ := newStore(nil) // locate returns no rows
+	_, found, err := st.ApplyEdit(t.Context(), []string{"chat"}, "GONE", true, sql.NullString{String: "x", Valid: true})
 	if err != nil || found {
 		t.Fatalf("found=%v err=%v, want false,nil", found, err)
 	}
+	if countCalls(db.Calls(), "UPDATE") != 0 {
+		t.Fatal("nothing to update")
+	}
 }
 
-func TestApplyEditWithoutNewColumnsStillUpdatesBody(t *testing.T) {
-	st, db, logs := newStore(func(c testdb.Call) testdb.Result {
+func TestApplyEditOfTheOtherSidesMessageIsRefused(t *testing.T) {
+	st, db, _ := newStore(locateHandler("chat", 1, nil)) // our message
+	_, _, err := st.ApplyEdit(t.Context(), []string{"chat"}, "OURS", false, sql.NullString{String: "x", Valid: true})
+	if !errors.Is(err, ErrNotAuthor) {
+		t.Fatalf("err=%v, want ErrNotAuthor", err)
+	}
+	if countCalls(db.Calls(), "UPDATE") != 0 {
+		t.Fatal("the contact must not rewrite our message")
+	}
+}
+
+func TestApplyEditWithoutNewColumnsLeavesOriginal(t *testing.T) {
+	st, db, logs := newStore(locateHandler("chat", 0, func(c testdb.Call) testdb.Result {
 		if has(c, "original_body") {
 			return testdb.Result{Err: errBadField}
 		}
-		if c.IsQuery {
-			return testdb.Result{Cols: []string{"1"}, Rows: [][]driver.Value{{int64(1)}}}
-		}
 		return testdb.Result{}
-	})
-	found, err := st.ApplyEdit(t.Context(), "chat", "M", false, sql.NullString{String: "new", Valid: true})
-	if err != nil || !found {
-		t.Fatalf("found=%v err=%v", found, err)
+	}))
+	ref, found, err := st.ApplyEdit(t.Context(), []string{"chat"}, "M", false, sql.NullString{String: "new", Valid: true})
+	if !errors.Is(err, ErrEditsUnsupported) || !found || ref.ChatJID != "chat" {
+		t.Fatalf("ref=%+v found=%v err=%v", ref, found, err)
 	}
-	calls := db.Calls()
-	if !has(calls[1], "UPDATE wa_messages SET body = ?") || has(calls[1], "original_body") {
-		t.Fatalf("expected legacy body-only update, got %s", calls[1].Query)
+	for _, c := range db.Calls() {
+		if has(c, "UPDATE wa_messages SET body") {
+			t.Fatalf("the original text must not be overwritten without original_body: %s", c.Query)
+		}
 	}
 	if len(*logs) != 1 {
 		t.Fatalf("one log line expected, got %v", *logs)
@@ -167,19 +205,14 @@ func TestApplyEditWithoutNewColumnsStillUpdatesBody(t *testing.T) {
 }
 
 func TestRevokeMessageTargetsOriginalById(t *testing.T) {
-	st, db, _ := newStore(func(c testdb.Call) testdb.Result {
-		if c.IsQuery {
-			return testdb.Result{Cols: []string{"1"}, Rows: [][]driver.Value{{int64(1)}}}
-		}
-		return testdb.Result{}
-	})
-	found, err := st.RevokeMessage(t.Context(), "chat@lid", "ORIG")
-	if err != nil || !found {
-		t.Fatalf("found=%v err=%v", found, err)
+	st, db, _ := newStore(locateHandler("5215511111111@s.whatsapp.net", 0, nil))
+	ref, found, err := st.RevokeMessage(t.Context(), []string{"123@lid", "5215511111111@s.whatsapp.net"}, "ORIG", false, false)
+	if err != nil || !found || ref.ChatJID != "5215511111111@s.whatsapp.net" {
+		t.Fatalf("ref=%+v found=%v err=%v", ref, found, err)
 	}
-	up := db.Calls()[0]
+	up := db.Calls()[1]
 	if !has(up, "UPDATE wa_messages", "revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP())", "WHERE id = ? AND chat_jid = ?") ||
-		up.Args[0] != "ORIG" || up.Args[1] != "chat@lid" {
+		up.Args[0] != "ORIG" || up.Args[1] != "5215511111111@s.whatsapp.net" {
 		t.Fatalf("unexpected revoke statement %+v", up)
 	}
 	if has(up, "body") {
@@ -187,26 +220,45 @@ func TestRevokeMessageTargetsOriginalById(t *testing.T) {
 	}
 }
 
+func TestRevokeMessageOneToOneOnlyByAuthor(t *testing.T) {
+	// 1:1: the contact cannot delete our message.
+	st, db, _ := newStore(locateHandler("chat", 1, nil))
+	if _, _, err := st.RevokeMessage(t.Context(), []string{"chat"}, "OURS", false, false); !errors.Is(err, ErrNotAuthor) {
+		t.Fatalf("err=%v, want ErrNotAuthor", err)
+	}
+	if countCalls(db.Calls(), "revoked_at") != 0 {
+		t.Fatal("must not flag our message")
+	}
+	// Group: an admin may delete anyone's message.
+	st, db, _ = newStore(locateHandler("g@g.us", 1, nil))
+	if _, found, err := st.RevokeMessage(t.Context(), []string{"g@g.us"}, "OURS", false, true); err != nil || !found {
+		t.Fatalf("group: found=%v err=%v", found, err)
+	}
+	if countCalls(db.Calls(), "revoked_at") != 1 {
+		t.Fatal("group delete must flag the message")
+	}
+}
+
 func TestRevokeMessageMissingOriginalOrOldSchema(t *testing.T) {
-	// Original missing: the existence check finds nothing.
+	// Original missing: the locate finds nothing.
 	st, _, _ := newStore(nil)
-	if found, err := st.RevokeMessage(t.Context(), "chat", "X"); err != nil || found {
+	if _, found, err := st.RevokeMessage(t.Context(), []string{"chat"}, "X", false, false); err != nil || found {
 		t.Fatalf("missing original: found=%v err=%v", found, err)
 	}
 	// Old schema: no revoked_at; caller must fall back to inserting a 'revoked' row.
-	st, db, logs := newStore(func(c testdb.Call) testdb.Result {
+	st, db, logs := newStore(locateHandler("chat", 0, func(c testdb.Call) testdb.Result {
 		if has(c, "revoked_at") {
 			return testdb.Result{Err: errBadField}
 		}
 		return testdb.Result{}
-	})
-	if found, err := st.RevokeMessage(t.Context(), "chat", "X"); err != nil || found {
+	}))
+	if _, found, err := st.RevokeMessage(t.Context(), []string{"chat"}, "X", false, false); err != nil || found {
 		t.Fatalf("old schema: found=%v err=%v", found, err)
 	}
-	if found, _ := st.RevokeMessage(t.Context(), "chat", "Y"); found {
+	if _, found, _ := st.RevokeMessage(t.Context(), []string{"chat"}, "Y", false, false); found {
 		t.Fatal("old schema must keep reporting not found")
 	}
-	if n := len(db.Calls()); n != 1 || len(*logs) != 1 {
+	if n := countCalls(db.Calls(), "revoked_at"); n != 1 || len(*logs) != 1 {
 		t.Fatalf("expected one probing statement and one log line, got %d / %v", n, *logs)
 	}
 }
@@ -258,16 +310,26 @@ func TestUpsertReactionGroupMatchesOnSender(t *testing.T) {
 	if err := st.UpsertReaction(t.Context(), r); err != nil {
 		t.Fatal(err)
 	}
-	if !has(db.Calls()[0], "AND sender_jid = ?") {
+	if !has(db.Calls()[0], "AND sender_jid IN (?)") {
 		t.Fatalf("group lookup must match on sender_jid: %s", db.Calls()[0].Query)
 	}
+	// Every known form of the sender (phone, LID) matches the earlier row.
+	db.Reset()
+	r.SenderAliases = []string{"5215511111111@s.whatsapp.net", "123@lid"}
+	if err := st.UpsertReaction(t.Context(), r); err != nil {
+		t.Fatal(err)
+	}
+	if c := db.Calls()[0]; !has(c, "AND sender_jid IN (?,?)") || c.Args[3] != "5215511111111@s.whatsapp.net" || c.Args[4] != "123@lid" {
+		t.Fatalf("group lookup must match on every sender alias: %+v", c)
+	}
+	r.SenderAliases = nil
 	// Our own reaction in a group matches on from_me alone.
 	db.Reset()
 	r.FromMe = true
 	if err := st.UpsertReaction(t.Context(), r); err != nil {
 		t.Fatal(err)
 	}
-	if has(db.Calls()[0], "sender_jid = ?") {
+	if has(db.Calls()[0], "sender_jid IN") {
 		t.Fatalf("own reaction must not match on sender_jid: %s", db.Calls()[0].Query)
 	}
 }
@@ -369,54 +431,135 @@ func TestHeartbeatWritesLastSeenAt(t *testing.T) {
 	}
 }
 
+func tailRows(msgType string, body, filename any, revoked int64) testdb.Result {
+	return testdb.Result{
+		Cols: []string{"message_type", "body", "media_filename", "revoked", "from_me", "timestamp"},
+		Rows: [][]driver.Value{{msgType, body, filename, revoked, int64(0), t0}},
+	}
+}
+
 func TestRecomputeChatTailFallsBackAndExcludesReactions(t *testing.T) {
 	st, db, _ := newStore(func(c testdb.Call) testdb.Result {
 		if has(c, "revoked_at") {
 			return testdb.Result{Err: errBadField}
 		}
+		if c.IsQuery {
+			return tailRows("text", "hola", nil, 0)
+		}
 		return testdb.Result{}
 	})
-	if err := st.RecomputeChatTail(t.Context(), "chat"); err != nil {
+	var got TailRow
+	if err := st.RecomputeChatTail(t.Context(), "chat", func(r TailRow) string { got = r; return "P" }); err != nil {
 		t.Fatal(err)
 	}
 	calls := db.Calls()
-	if len(calls) != 2 || !has(calls[0], "Mensaje eliminado") || has(calls[1], "revoked_at") {
-		t.Fatalf("expected new then legacy tail statement: %+v", calls)
+	if len(calls) != 3 || has(calls[1], "revoked_at") {
+		t.Fatalf("expected new select, legacy select, update: %+v", calls)
 	}
-	for _, c := range calls {
+	for _, c := range calls[:2] {
 		if !has(c, "message_type NOT IN ('reaction', 'system')") {
 			t.Fatalf("reactions and system rows must not become the tail: %s", c.Query)
 		}
 	}
+	up := calls[2]
+	if !has(up, "UPDATE wa_chats SET last_message_at = ?, last_message_preview = ?, last_message_from_me = ?") || up.Args[1] != "P" || up.Args[3] != "chat" {
+		t.Fatalf("unexpected tail update %+v", up)
+	}
+	if got.MessageType != "text" || got.Body.String != "hola" {
+		t.Fatalf("preview got %+v", got)
+	}
 }
 
-func TestClearUnread(t *testing.T) {
+func TestRecomputeChatTailPassesMediaAndRevokedToPreview(t *testing.T) {
+	st, db, _ := newStore(func(c testdb.Call) testdb.Result {
+		if c.IsQuery {
+			return tailRows("image", nil, nil, 1)
+		}
+		return testdb.Result{}
+	})
+	var got TailRow
+	if err := st.RecomputeChatTail(t.Context(), "chat", func(r TailRow) string { got = r; return "x" }); err != nil {
+		t.Fatal(err)
+	}
+	if got.MessageType != "image" || got.Body.Valid || !got.Revoked {
+		t.Fatalf("got %+v", got)
+	}
+	// No countable row: the chat is left as it is.
+	st, db, _ = newStore(nil)
+	if err := st.RecomputeChatTail(t.Context(), "chat", func(TailRow) string { return "x" }); err != nil {
+		t.Fatal(err)
+	}
+	if countCalls(db.Calls(), "UPDATE") != 0 {
+		t.Fatal("empty chat must not be updated")
+	}
+}
+
+func TestClearUnreadUpToCountsOnlyNewerInbound(t *testing.T) {
 	st, db, _ := newStore(nil)
-	if err := st.ClearUnread(t.Context(), "chat@lid"); err != nil {
+	if err := st.ClearUnreadUpTo(t.Context(), "chat@lid", []string{"A", "B"}); err != nil {
 		t.Fatal(err)
 	}
 	c := db.Calls()[0]
-	if !has(c, "UPDATE wa_chats SET unread_count = 0 WHERE jid = ?") || c.Args[0] != "chat@lid" {
+	if !has(c, "UPDATE wa_chats c", "LEAST(c.unread_count", "m.from_me = 0", "r.id IN (?,?)", "WHERE c.jid = ? AND c.unread_count > 0") ||
+		c.Args[0] != "A" || c.Args[1] != "B" || c.Args[2] != "chat@lid" {
 		t.Fatalf("unexpected %+v", c)
+	}
+	db.Reset()
+	if err := st.ClearUnreadUpTo(t.Context(), "chat", nil); err != nil || len(db.Calls()) != 0 {
+		t.Fatal("no ids, nothing to do")
 	}
 }
 
 func TestGetQuotedRow(t *testing.T) {
-	st, _, _ := newStore(func(c testdb.Call) testdb.Result {
+	st, db, _ := newStore(func(c testdb.Call) testdb.Result {
 		return testdb.Result{
-			Cols: []string{"sender_jid", "from_me", "message_type", "body", "media_filename"},
-			Rows: [][]driver.Value{{"5215500000000@s.whatsapp.net", int64(1), "document", nil, "guia.pdf"}},
+			Cols: []string{"sender_jid", "from_me", "message_type", "body", "media_filename", "revoked"},
+			Rows: [][]driver.Value{{"5215500000000@s.whatsapp.net", int64(1), "document", nil, "guia.pdf", int64(0)}},
 		}
 	})
 	row, found, err := st.GetQuotedRow(t.Context(), "chat", "ID")
 	if err != nil || !found {
 		t.Fatalf("found=%v err=%v", found, err)
 	}
-	if !row.FromMe || row.MessageType != "document" || row.Body.Valid || row.MediaFilename.String != "guia.pdf" {
+	if !row.FromMe || row.MessageType != "document" || row.Body.Valid || row.MediaFilename.String != "guia.pdf" || row.Revoked || !row.Quotable() {
 		t.Fatalf("unexpected row %+v", row)
+	}
+	if !has(db.Calls()[0], "revoked_at IS NOT NULL") {
+		t.Fatal("the quote lookup must read revoked_at")
 	}
 	st, _, _ = newStore(nil)
 	if _, found, err := st.GetQuotedRow(t.Context(), "chat", "ID"); found || err != nil {
 		t.Fatalf("missing row: found=%v err=%v", found, err)
+	}
+	// Old schema: falls back without revoked_at.
+	st, db, _ = newStore(func(c testdb.Call) testdb.Result {
+		if has(c, "revoked_at") {
+			return testdb.Result{Err: errBadField}
+		}
+		return testdb.Result{
+			Cols: []string{"sender_jid", "from_me", "message_type", "body", "media_filename", "0"},
+			Rows: [][]driver.Value{{nil, int64(0), "text", "hola", nil, int64(0)}},
+		}
+	})
+	if row, found, err := st.GetQuotedRow(t.Context(), "chat", "ID"); err != nil || !found || row.Body.String != "hola" {
+		t.Fatalf("legacy: row=%+v found=%v err=%v", row, found, err)
+	}
+}
+
+func TestQuotedRowQuotable(t *testing.T) {
+	for _, c := range []struct {
+		row  QuotedRow
+		want bool
+	}{
+		{QuotedRow{MessageType: "text"}, true},
+		{QuotedRow{MessageType: "image"}, true},
+		{QuotedRow{MessageType: "text", Revoked: true}, false},
+		{QuotedRow{MessageType: "revoked"}, false},
+		{QuotedRow{MessageType: "reaction"}, false},
+		{QuotedRow{MessageType: "system"}, false},
+	} {
+		if got := c.row.Quotable(); got != c.want {
+			t.Errorf("%+v: got %v", c.row, got)
+		}
 	}
 }

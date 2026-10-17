@@ -346,6 +346,7 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 		chatJID := b.canonicalChatJID(ctx, rawChatJID)
 		chatJIDStr := chatJID.String()
 		isGroup := chatJID.Server == types.GroupServer
+		histChats := b.chatAliases(ctx, rawChatJID, chatJID)
 
 		displayName := b.resolveDisplayNameForJID(ctx, chatJID, conv.GetName())
 		phoneE164 := sql.NullString{}
@@ -386,7 +387,8 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 			// Deletes for everyone inside the history flag the original
 			// row instead of adding a "deleted" bubble next to it.
 			if act := resolveAction(ctx, parsed, nil); act.Kind == actionRevoke {
-				if found, rerr := b.store.RevokeMessage(ctx, chatJIDStr, act.TargetID); rerr == nil && found {
+				_, found, rerr := b.store.RevokeMessage(ctx, histChats, act.TargetID, parsed.Info.IsFromMe, isGroup)
+				if errors.Is(rerr, store.ErrNotAuthor) || (rerr == nil && found) {
 					continue
 				}
 			}
@@ -397,7 +399,9 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 			}
 			if msgType == "reaction" {
 				if rm, ok, _ := reactionOf(ctx, parsed, nil); ok && rm != nil {
-					if rerr := b.store.UpsertReaction(ctx, reactionRecord(parsed.Info, chatJIDStr, rm)); rerr != nil {
+					rec := reactionRecord(parsed.Info, chatJIDStr, rm)
+					rec.SenderAliases = b.senderAliases(ctx, parsed.Info.Sender)
+					if rerr := b.store.UpsertReaction(ctx, rec); rerr != nil {
 						b.logger.Warnf("History sync reaction %s: %v", parsed.Info.ID, rerr)
 					}
 				}
@@ -439,7 +443,7 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 		}
 
 		if inserted > 0 {
-			if err := b.store.RecomputeChatTail(ctx, chatJIDStr); err != nil {
+			if err := b.store.RecomputeChatTail(ctx, chatJIDStr, tailPreview); err != nil {
 				b.logger.Warnf("RecomputeChatTail %s: %v", chatJIDStr, err)
 			}
 		}
@@ -496,8 +500,12 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	fromMe := evt.Info.IsFromMe
 	timestamp := evt.Info.Timestamp
 
+	// Every form this chat may be stored under: an edit, delete or reaction
+	// can target a message stored before the chat's LID mapping was known.
+	chats := b.chatAliases(ctx, evt.Info.Chat, canonicalChat)
+
 	// Edits and deletes act on an earlier row instead of adding one.
-	if b.applyProtocolAction(ctx, evt, chatJID, resolveAction(ctx, evt, b.decryptSecret)) {
+	if b.applyProtocolAction(ctx, evt, chats, resolveAction(ctx, evt, b.decryptSecret)) {
 		return
 	}
 	// Reactions update the reacted-to message; they never move the chat.
@@ -506,7 +514,7 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 			b.logger.Infof("Reaction %s not stored: %v", evt.Info.ID, rerr)
 			return
 		}
-		b.storeReaction(ctx, evt, chatJID, rm)
+		b.storeReaction(ctx, evt, chats, rm)
 		return
 	}
 
@@ -602,9 +610,10 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 }
 
 // applyProtocolAction carries out an edit or a delete-for-everyone against the
-// stored original. It reports whether the event was fully handled (and so
+// stored original. chats lists the forms the chat may be stored under,
+// canonical first. It reports whether the event was fully handled (and so
 // must not be stored as a message of its own).
-func (b *Bridge) applyProtocolAction(ctx context.Context, evt *events.Message, chatJID string, act protoAction) bool {
+func (b *Bridge) applyProtocolAction(ctx context.Context, evt *events.Message, chats []string, act protoAction) bool {
 	switch act.Kind {
 	case actionDrop:
 		b.logger.Infof("Ignoring %s: %s", evt.Info.ID, act.Reason)
@@ -612,51 +621,211 @@ func (b *Bridge) applyProtocolAction(ctx context.Context, evt *events.Message, c
 
 	case actionEdit:
 		_, body, _ := classifyMessage(act.Edited)
-		found, err := b.store.ApplyEdit(ctx, chatJID, act.TargetID, evt.Info.IsFromMe, nullString(body))
+		var (
+			ref   store.MessageRef
+			found bool
+		)
+		err := storeRetry(func(c context.Context) error {
+			var e error
+			ref, found, e = b.store.ApplyEdit(c, chats, act.TargetID, evt.Info.IsFromMe, nullString(body))
+			return e
+		})
 		switch {
+		case errors.Is(err, store.ErrNotAuthor):
+			b.logger.Warnf("Edit %s names message %s of the other side - ignored", evt.Info.ID, act.TargetID)
+		case errors.Is(err, store.ErrEditsUnsupported):
+			// Old schema: keep the original and store the new text next to it.
+			b.storeEditAsRow(evt, ref.ChatJID, body)
 		case err != nil:
-			b.logger.Warnf("ApplyEdit %s: %v", act.TargetID, err)
+			b.logger.Errorf("ApplyEdit %s failed after retries, the edit is lost: %v", act.TargetID, err)
 		case !found:
 			// Edit of a message we never stored (older than the bridge, or
 			// sent before pairing). Nothing visible to fix.
 			b.logger.Infof("Edit for unknown message %s ignored", act.TargetID)
 		default:
-			if err := b.store.RecomputeChatTail(ctx, chatJID); err != nil {
-				b.logger.Warnf("RecomputeChatTail %s: %v", chatJID, err)
-			}
+			b.recomputeTail(ref.ChatJID)
 		}
 		return true
 
 	case actionRevoke:
-		found, err := b.store.RevokeMessage(ctx, chatJID, act.TargetID)
-		if err != nil {
-			b.logger.Warnf("RevokeMessage %s: %v", act.TargetID, err)
+		var (
+			ref   store.MessageRef
+			found bool
+		)
+		err := storeRetry(func(c context.Context) error {
+			var e error
+			ref, found, e = b.store.RevokeMessage(c, chats, act.TargetID, evt.Info.IsFromMe, evt.Info.IsGroup)
+			return e
+		})
+		switch {
+		case errors.Is(err, store.ErrNotAuthor):
+			// Only a modified client can delete the other side's message in
+			// a 1:1 chat.
+			b.logger.Warnf("Delete %s names message %s of the other side - ignored", evt.Info.ID, act.TargetID)
 			return true
-		}
-		if !found {
+		case err != nil:
+			// The original could not be flagged: store the 'revoked' row so
+			// the delete is at least visible in the thread.
+			b.logger.Errorf("RevokeMessage %s failed after retries: %v", act.TargetID, err)
+			return false
+		case !found:
 			// Original not stored: keep the old behaviour (a 'revoked' row)
 			// so the delete is still visible in the thread.
 			return false
 		}
-		if err := b.store.RecomputeChatTail(ctx, chatJID); err != nil {
-			b.logger.Warnf("RecomputeChatTail %s: %v", chatJID, err)
-		}
+		b.recomputeTail(ref.ChatJID)
 		return true
 	}
 	return false
+}
+
+// storeEditAsRow keeps an edit on a schema without the edit columns: the new
+// text becomes a row of its own, the original stays as it was.
+func (b *Bridge) storeEditAsRow(evt *events.Message, chatJID, body string) {
+	err := storeRetry(func(c context.Context) error {
+		return b.store.InsertMessage(c, store.Message{
+			ID:          evt.Info.ID,
+			ChatJID:     chatJID,
+			SenderJID:   nullString(evt.Info.Sender.String()),
+			FromMe:      evt.Info.IsFromMe,
+			MessageType: "text",
+			Body:        nullString(body),
+			Timestamp:   evt.Info.Timestamp,
+			Status:      sql.NullString{String: defaultStatus(evt.Info.IsFromMe), Valid: true},
+		})
+	})
+	if err != nil {
+		b.logger.Errorf("Store edit %s as a row: %v", evt.Info.ID, err)
+		return
+	}
+	b.recomputeTail(chatJID)
+}
+
+func (b *Bridge) recomputeTail(chatJID string) {
+	if err := storeRetry(func(c context.Context) error {
+		return b.store.RecomputeChatTail(c, chatJID, tailPreview)
+	}); err != nil {
+		b.logger.Warnf("RecomputeChatTail %s: %v", chatJID, err)
+	}
+}
+
+// tailPreview is the chat-list label for a recomputed tail row, with the same
+// rules as the live path (previewFor).
+func tailPreview(t store.TailRow) string {
+	if t.Revoked {
+		return "Mensaje eliminado"
+	}
+	var m *mediaDescriptor
+	if t.MediaFilename.Valid {
+		m = &mediaDescriptor{filename: t.MediaFilename.String}
+	}
+	return previewFor(t.MessageType, t.Body.String, m)
+}
+
+// retryDelays are the waits before each attempt of storeRetry (tests shorten
+// them).
+var retryDelays = []time.Duration{0, 2 * time.Second, 5 * time.Second}
+
+// storeRetry runs a store call up to len(retryDelays) times, each attempt with
+// a fresh 20 s deadline: the event's own context may already be spent by a
+// slow tunnel, and an edit or delete that fails here is never re-delivered.
+// ErrNotAuthor and ErrEditsUnsupported are answers, not failures.
+func storeRetry(fn func(context.Context) error) error {
+	var err error
+	for _, d := range retryDelays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err = fn(ctx)
+		cancel()
+		if err == nil || errors.Is(err, store.ErrNotAuthor) || errors.Is(err, store.ErrEditsUnsupported) {
+			return err
+		}
+	}
+	return err
 }
 
 // storeReaction writes a reaction (or its removal) without touching the
 // chat's last-message tail or unread count. It creates no chat row: a reaction
 // in a chat we have no messages for has nothing to attach to, and the
 // INSERT IGNORE in the store drops it on the foreign key.
-func (b *Bridge) storeReaction(ctx context.Context, evt *events.Message, chatJID string, rm *waProto.ReactionMessage) {
+func (b *Bridge) storeReaction(ctx context.Context, evt *events.Message, chats []string, rm *waProto.ReactionMessage) {
 	if rm.GetKey().GetID() == "" {
+		b.logger.Infof("Reaction %s without a target message ignored", evt.Info.ID)
 		return
 	}
-	if err := b.store.UpsertReaction(ctx, reactionRecord(evt.Info, chatJID, rm)); err != nil {
+	rec := reactionRecord(evt.Info, chats[0], rm)
+	// The reaction lives in the same chat row as the message it targets.
+	if len(chats) > 1 {
+		if ref, found, err := b.store.LocateMessage(ctx, rec.TargetID, chats); err == nil && found {
+			rec.ChatJID = ref.ChatJID
+		}
+	}
+	rec.SenderAliases = b.senderAliases(ctx, evt.Info.Sender)
+	if err := b.store.UpsertReaction(ctx, rec); err != nil {
 		b.logger.Warnf("UpsertReaction %s: %v", evt.Info.ID, err)
 	}
+}
+
+// chatAliases lists every form a chat may be stored under, canonical first:
+// the canonical JID, the raw one the event came with, and the phone JID of a
+// LID chat (rows stored before the mapping was learned keep that form).
+func (b *Bridge) chatAliases(ctx context.Context, raw, canonical types.JID) []string {
+	out := []string{canonical.String()}
+	add := func(j types.JID) {
+		if j.IsEmpty() || j.User == "" {
+			return
+		}
+		s := j.String()
+		for _, o := range out {
+			if o == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	add(raw)
+	if b.client != nil && b.client.Store != nil && b.client.Store.LIDs != nil {
+		add(b.resolvePNForLID(ctx, canonical))
+		add(b.resolvePNForLID(ctx, raw))
+	}
+	return out
+}
+
+// senderAliases lists every form a group member's reactions may be stored
+// under: the JID without device suffix, its phone/LID counterpart, and the raw
+// form with the device suffix.
+func (b *Bridge) senderAliases(ctx context.Context, sender types.JID) []string {
+	if sender.IsEmpty() {
+		return nil
+	}
+	base := sender.ToNonAD()
+	out := []string{base.String()}
+	add := func(j types.JID) {
+		if j.IsEmpty() || j.User == "" {
+			return
+		}
+		s := j.String()
+		for _, o := range out {
+			if o == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	add(sender)
+	if b.client != nil && b.client.Store != nil && b.client.Store.LIDs != nil {
+		switch base.Server {
+		case types.HiddenUserServer:
+			add(b.resolvePNForLID(ctx, base))
+		case types.DefaultUserServer:
+			if lid, err := b.client.Store.LIDs.GetLIDForPN(ctx, base); err == nil {
+				add(lid)
+			}
+		}
+	}
+	return out
 }
 
 // markOnline tells WhatsApp we're available. Without it the server
@@ -725,8 +894,14 @@ func (b *Bridge) handleReceipt(evt *events.Receipt) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		chatJID := b.canonicalChatJID(ctx, evt.Chat).String()
-		if err := b.store.ClearUnread(ctx, chatJID); err != nil {
-			b.logger.Warnf("ClearUnread %s: %v", chatJID, err)
+		ids := make([]string, 0, len(evt.MessageIDs))
+		for _, id := range evt.MessageIDs {
+			ids = append(ids, string(id))
+		}
+		// Only what the receipt covers is read: a message that arrived
+		// after the staff opened the chat on the phone stays unread.
+		if err := b.store.ClearUnreadUpTo(ctx, chatJID, ids); err != nil {
+			b.logger.Warnf("ClearUnreadUpTo %s: %v", chatJID, err)
 		}
 		return
 	}
@@ -1550,6 +1725,12 @@ func (b *Bridge) lookupQuote(ctx context.Context, r outboundRow, chatJID types.J
 		b.logger.Infof("Outbound %d: quoted message %s not found, sending without quote", r.ID, r.QuotedMessageID.String)
 		return nil, nil
 	}
+	if !row.Quotable() {
+		// A deleted message's body is kept for audit only: quoting it
+		// would send the deleted text back to every recipient.
+		b.logger.Infof("Outbound %d: quoted message %s was deleted or cannot be quoted, sending without quote", r.ID, r.QuotedMessageID.String)
+		return nil, nil
+	}
 	participant := participantFor(row, chatJID, b.ownPN(), b.ownLID())
 	if participant.IsEmpty() {
 		b.logger.Infof("Outbound %d: author of quoted message %s unknown, sending without quote", r.ID, r.QuotedMessageID.String)
@@ -1589,6 +1770,10 @@ func (b *Bridge) sendReactionRow(ctx context.Context, r outboundRow, chatJID typ
 	}
 	if !found {
 		b.markOutboundPermanentlyFailed(ctx, r.ID, "reacted message not found: "+r.QuotedMessageID.String)
+		return
+	}
+	if !row.Quotable() {
+		b.markOutboundPermanentlyFailed(ctx, r.ID, "reacted message was deleted or cannot take a reaction: "+r.QuotedMessageID.String)
 		return
 	}
 	sender := participantFor(row, chatJID, b.ownPN(), b.ownLID())

@@ -398,70 +398,120 @@ func (s *Store) InsertMessage(ctx context.Context, m Message) error {
 	})
 }
 
-// ApplyEdit rewrites the body of an existing message after the sender edited
+// ErrNotAuthor is returned when an edit (or a 1:1 delete) names a message the
+// sender did not write. Official clients never send that; the event is ignored.
+var ErrNotAuthor = errors.New("message belongs to the other side")
+
+// ErrEditsUnsupported is returned by ApplyEdit when the schema predates the
+// edit columns: the original is left untouched and the caller stores the new
+// text as a row of its own (what the previous release did), so neither text
+// is lost.
+var ErrEditsUnsupported = errors.New("schema has no edit columns")
+
+// MessageRef says where a stored message lives.
+type MessageRef struct {
+	ChatJID string
+	FromMe  bool
+}
+
+// LocateMessage finds a message by its id among the forms its chat may be
+// stored under (canonical LID, raw phone JID...). wa_messages.id is the
+// primary key; the chat list only stops an event from one chat touching a
+// message of another. A chat whose LID mapping was learned after the
+// message was stored keeps that message under the phone JID, so callers
+// pass every alias they know.
+func (s *Store) LocateMessage(ctx context.Context, id string, chats []string) (MessageRef, bool, error) {
+	if id == "" || len(chats) == 0 {
+		return MessageRef{}, false, nil
+	}
+	ph := make([]string, len(chats))
+	args := make([]any, 0, len(chats)+1)
+	args = append(args, id)
+	for i, c := range chats {
+		ph[i] = "?"
+		args = append(args, c)
+	}
+	var ref MessageRef
+	var fromMe int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT chat_jid, from_me FROM wa_messages WHERE id = ? AND chat_jid IN (`+strings.Join(ph, ",")+`) LIMIT 1`,
+		args...).Scan(&ref.ChatJID, &fromMe)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MessageRef{}, false, nil
+	}
+	if err != nil {
+		return MessageRef{}, false, err
+	}
+	ref.FromMe = fromMe == 1
+	return ref, true, nil
+}
+
+// ApplyEdit rewrites the body of an existing message after its author edited
 // it: original_body keeps the text from before the FIRST edit (an address a
 // customer later changes is worth auditing), body takes the new text and
-// edited_at is stamped. No new row is created. It returns false when the
-// original message is not in the table (or belongs to another chat or
-// sender direction), so the caller can ignore the edit.
-func (s *Store) ApplyEdit(ctx context.Context, chatJID, targetID string, fromMe bool, newBody sql.NullString) (bool, error) {
-	err := s.Fallback(featureEdits, func() error {
+// edited_at is stamped. No new row is created. found=false means the original
+// is not stored under any of chats; ErrNotAuthor means it was written by the
+// other side; ErrEditsUnsupported means the schema has no edit columns (the
+// original is left as it was). ref.ChatJID is the chat the row lives in.
+func (s *Store) ApplyEdit(ctx context.Context, chats []string, targetID string, fromMe bool, newBody sql.NullString) (MessageRef, bool, error) {
+	ref, found, err := s.LocateMessage(ctx, targetID, chats)
+	if err != nil || !found {
+		return ref, found, err
+	}
+	if ref.FromMe != fromMe {
+		return ref, true, ErrNotAuthor
+	}
+	err = s.Fallback(featureEdits, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			UPDATE wa_messages
 			SET original_body = COALESCE(original_body, body),
 			    body          = ?,
 			    edited_at     = UTC_TIMESTAMP()
-			WHERE id = ? AND chat_jid = ? AND from_me = ?
-		`, newBody, targetID, chatJID, boolInt(fromMe))
+			WHERE id = ? AND chat_jid = ?
+		`, newBody, targetID, ref.ChatJID)
 		return err
-	}, func() error {
-		_, err := s.db.ExecContext(ctx, `
-			UPDATE wa_messages SET body = ?
-			WHERE id = ? AND chat_jid = ? AND from_me = ?
-		`, newBody, targetID, chatJID, boolInt(fromMe))
-		return err
-	})
+	}, nil)
 	if err != nil {
-		return false, err
+		return ref, true, err
 	}
-	// RowsAffected counts changed rows only (an identical re-delivered edit
-	// within the same second changes nothing), so existence is its own query.
-	return s.messageExists(ctx, chatJID, targetID)
+	if s.FeatureOff(featureEdits) {
+		return ref, true, ErrEditsUnsupported
+	}
+	return ref, true, nil
 }
 
 // RevokeMessage marks the original message as deleted for everyone, keeping
-// its body for audit (the PHP layer hides it). It returns false when the
-// original is not stored, or when the schema predates revoked_at; the caller
-// then keeps the old behaviour and inserts a 'revoked' row.
-func (s *Store) RevokeMessage(ctx context.Context, chatJID, targetID string) (bool, error) {
+// its body for audit (the PHP layer hides it). In a 1:1 chat only the author
+// can delete (ErrNotAuthor otherwise); in a group an admin may delete anyone's
+// message. found=false when the original is not stored, or when the schema
+// predates revoked_at; the caller then keeps the old behaviour and inserts a
+// 'revoked' row.
+func (s *Store) RevokeMessage(ctx context.Context, chats []string, targetID string, fromMe, isGroup bool) (MessageRef, bool, error) {
 	if s.FeatureOff(featureEdits) {
-		return false, nil
+		return MessageRef{}, false, nil
 	}
-	err := s.Fallback(featureEdits, func() error {
+	ref, found, err := s.LocateMessage(ctx, targetID, chats)
+	if err != nil || !found {
+		return ref, found, err
+	}
+	if !isGroup && ref.FromMe != fromMe {
+		return ref, true, ErrNotAuthor
+	}
+	err = s.Fallback(featureEdits, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			UPDATE wa_messages
 			SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP())
 			WHERE id = ? AND chat_jid = ?
-		`, targetID, chatJID)
+		`, targetID, ref.ChatJID)
 		return err
 	}, nil)
 	if err != nil {
-		return false, err
+		return ref, true, err
 	}
 	if s.FeatureOff(featureEdits) {
-		return false, nil
+		return ref, false, nil
 	}
-	return s.messageExists(ctx, chatJID, targetID)
-}
-
-func (s *Store) messageExists(ctx context.Context, chatJID, id string) (bool, error) {
-	var one int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM wa_messages WHERE id = ? AND chat_jid = ? LIMIT 1`, id, chatJID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
+	return ref, true, nil
 }
 
 // Reaction is one reaction event. Emoji == "" means the sender removed theirs.
@@ -469,11 +519,15 @@ type Reaction struct {
 	ID        string // id of the reaction message itself
 	ChatJID   string
 	SenderJID sql.NullString
-	FromMe    bool
-	IsGroup   bool
-	TargetID  string // the message reacted to
-	Emoji     string
-	Timestamp time.Time
+	// SenderAliases are every form of the sender's JID (without a device
+	// suffix: phone and LID) that an earlier reaction of theirs may be stored
+	// under. Group chats match on them; empty means SenderJID alone.
+	SenderAliases []string
+	FromMe        bool
+	IsGroup       bool
+	TargetID      string // the message reacted to
+	Emoji         string
+	Timestamp     time.Time
 }
 
 // UpsertReaction keeps one reaction per (sender, target message): a new
@@ -484,7 +538,9 @@ type Reaction struct {
 // the reaction aggregation) and keeps its target_message_id so a later
 // reaction by the same sender revives it. In a 1:1 chat there are only two
 // possible reactors, so the match is on from_me alone: the contact's sender
-// JID can flip between phone and LID form between events.
+// JID can flip between phone and LID form between events. In a group the
+// match is on every known form of the sender (SenderAliases), so a member who
+// reacts from another device or under their LID still has one reaction.
 //
 // The reacted-to message gets its status_updated_at bumped so the web
 // client's incremental refresh picks the new chip up.
@@ -499,8 +555,16 @@ func (s *Store) UpsertReaction(ctx context.Context, r Reaction) error {
 			  AND message_type IN ('reaction', 'system') AND from_me = ?`
 		args := []any{r.ChatJID, r.TargetID, boolInt(r.FromMe)}
 		if !r.FromMe && r.IsGroup {
-			q += ` AND sender_jid = ?`
-			args = append(args, r.SenderJID)
+			senders := r.SenderAliases
+			if len(senders) == 0 {
+				senders = []string{r.SenderJID.String}
+			}
+			ph := make([]string, len(senders))
+			for i, sj := range senders {
+				ph[i] = "?"
+				args = append(args, sj)
+			}
+			q += ` AND sender_jid IN (` + strings.Join(ph, ",") + `)`
 		}
 		q += ` ORDER BY timestamp DESC LIMIT 1`
 		e := s.db.QueryRowContext(ctx, q, args...).Scan(&existing)
@@ -590,32 +654,81 @@ type QuotedRow struct {
 	MessageType   string
 	Body          sql.NullString
 	MediaFilename sql.NullString
+	// Revoked is true when the message was deleted for everyone (revoked_at
+	// set, or a legacy 'revoked' row). Its body is kept for audit only and
+	// must never be sent again inside a quote.
+	Revoked bool
+}
+
+// Quotable reports whether a reply or a reaction may point at the row:
+// never at a deleted message, a reaction or a protocol row.
+func (r QuotedRow) Quotable() bool {
+	if r.Revoked {
+		return false
+	}
+	switch r.MessageType {
+	case "revoked", "reaction", "system":
+		return false
+	}
+	return true
 }
 
 // GetQuotedRow loads the message a reply or reaction targets. found=false
 // means the row is not in the table.
 func (s *Store) GetQuotedRow(ctx context.Context, chatJID, id string) (row QuotedRow, found bool, err error) {
-	var fromMe int
-	err = s.db.QueryRowContext(ctx, `
-		SELECT sender_jid, from_me, message_type, body, media_filename
-		FROM wa_messages WHERE id = ? AND chat_jid = ? LIMIT 1
-	`, id, chatJID).Scan(&row.SenderJID, &fromMe, &row.MessageType, &row.Body, &row.MediaFilename)
+	scan := func(q string) func() error {
+		return func() error {
+			var fromMe, revoked int
+			e := s.db.QueryRowContext(ctx, q, id, chatJID).Scan(
+				&row.SenderJID, &fromMe, &row.MessageType, &row.Body, &row.MediaFilename, &revoked)
+			row.FromMe = fromMe == 1
+			row.Revoked = revoked == 1
+			return e
+		}
+	}
+	err = s.Fallback(featureEdits,
+		scan(`SELECT sender_jid, from_me, message_type, body, media_filename, revoked_at IS NOT NULL
+			FROM wa_messages WHERE id = ? AND chat_jid = ? LIMIT 1`),
+		scan(`SELECT sender_jid, from_me, message_type, body, media_filename, 0
+			FROM wa_messages WHERE id = ? AND chat_jid = ? LIMIT 1`))
 	if errors.Is(err, sql.ErrNoRows) {
 		return QuotedRow{}, false, nil
 	}
 	if err != nil {
 		return QuotedRow{}, false, err
 	}
-	row.FromMe = fromMe == 1
 	return row, true, nil
 }
 
-// ClearUnread zeroes a chat's unread counter. Used when the staff read the
-// chat on the phone or WhatsApp Web (a read receipt from one of our own
-// devices).
-func (s *Store) ClearUnread(ctx context.Context, chatJID string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE wa_chats SET unread_count = 0 WHERE jid = ? AND unread_count > 0`, chatJID)
+// ClearUnreadUpTo handles a read receipt from one of our own devices (the
+// staff read the chat on the phone or WhatsApp Web). The receipt names the
+// messages that were read; inbound messages newer than the newest of them
+// arrived after that read and stay unread. When none of the ids is stored the
+// whole chat is cleared, as before. The count never goes up.
+func (s *Store) ClearUnreadUpTo(ctx context.Context, chatJID string, readIDs []string) error {
+	if len(readIDs) == 0 {
+		return nil
+	}
+	ph := make([]string, len(readIDs))
+	args := make([]any, 0, len(readIDs)+1)
+	for i, id := range readIDs {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, chatJID)
+	q := `
+		UPDATE wa_chats c
+		SET c.unread_count = LEAST(c.unread_count, (
+			SELECT COUNT(*) FROM wa_messages m
+			WHERE m.chat_jid = c.jid
+			  AND m.from_me = 0
+			  AND m.message_type NOT IN ('reaction', 'system')
+			  AND m.timestamp > COALESCE(
+			      (SELECT MAX(r.timestamp) FROM wa_messages r WHERE r.id IN (` + strings.Join(ph, ",") + `)),
+			      '9999-12-31')
+		))
+		WHERE c.jid = ? AND c.unread_count > 0`
+	_, err := s.db.ExecContext(ctx, q, args...)
 	return err
 }
 
@@ -678,40 +791,56 @@ func (s *Store) MarkMessagesStatus(ctx context.Context, ids []string, newStatus 
 	return err
 }
 
+// TailRow is the newest countable message of a chat.
+type TailRow struct {
+	MessageType   string
+	Body          sql.NullString
+	MediaFilename sql.NullString
+	Revoked       bool
+	FromMe        bool
+	Timestamp     time.Time
+}
+
 // RecomputeChatTail refreshes last_message_at / preview / from_me on a chat
 // from whatever is currently in wa_messages. Used after backfilling history
 // in bulk, and after an edit or a revoke changed what the tail row says.
 // Reaction and system rows never count as the tail (WhatsApp does not move a
-// chat for a reaction). A chat with no countable row is left as it is.
-func (s *Store) RecomputeChatTail(ctx context.Context, chatJID string) error {
-	return s.Fallback(featureEdits, func() error {
-		_, err := s.db.ExecContext(ctx, tailQuery(`CASE WHEN tail.revoked_at IS NOT NULL THEN 'Mensaje eliminado' ELSE LEFT(COALESCE(tail.body, ''), 160) END`), chatJID, chatJID)
+// chat for a reaction). preview builds the list label from the tail row with
+// the same rules the live path uses (a caption-less photo is "Imagen", not
+// blank). A chat with no countable row is left as it is.
+func (s *Store) RecomputeChatTail(ctx context.Context, chatJID string, preview func(TailRow) string) error {
+	var t TailRow
+	scan := func(q string) func() error {
+		return func() error {
+			var fromMe, revoked int
+			e := s.db.QueryRowContext(ctx, q, chatJID).Scan(
+				&t.MessageType, &t.Body, &t.MediaFilename, &revoked, &fromMe, &t.Timestamp)
+			t.FromMe = fromMe == 1
+			t.Revoked = revoked == 1
+			return e
+		}
+	}
+	const tail = `
+		FROM wa_messages
+		WHERE chat_jid = ?
+		  AND message_type NOT IN ('reaction', 'system')
+		ORDER BY timestamp DESC, id DESC
+		LIMIT 1`
+	err := s.Fallback(featureEdits,
+		scan(`SELECT message_type, body, media_filename, revoked_at IS NOT NULL, from_me, timestamp`+tail),
+		scan(`SELECT message_type, body, media_filename, 0, from_me, timestamp`+tail))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		return err
-	}, func() error {
-		_, err := s.db.ExecContext(ctx, tailQuery(`LEFT(COALESCE(tail.body, ''), 160)`), chatJID, chatJID)
-		return err
-	})
-}
-
-func tailQuery(previewExpr string) string {
-	return `
-		UPDATE wa_chats c
-		LEFT JOIN (
-			SELECT chat_jid,
-			       MAX(timestamp) AS max_ts
-			FROM wa_messages
-			WHERE chat_jid = ?
-			  AND message_type NOT IN ('reaction', 'system')
-			GROUP BY chat_jid
-		) agg ON agg.chat_jid = c.jid
-		LEFT JOIN wa_messages tail
-		       ON tail.chat_jid = c.jid AND tail.timestamp = agg.max_ts
-		      AND tail.message_type NOT IN ('reaction', 'system')
-		SET c.last_message_at      = COALESCE(agg.max_ts, c.last_message_at),
-		    c.last_message_preview = CASE WHEN agg.max_ts IS NULL THEN c.last_message_preview ELSE ` + previewExpr + ` END,
-		    c.last_message_from_me = CASE WHEN agg.max_ts IS NULL THEN c.last_message_from_me ELSE COALESCE(tail.from_me, 0) END
-		WHERE c.jid = ?
-	`
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE wa_chats
+		SET last_message_at = ?, last_message_preview = ?, last_message_from_me = ?
+		WHERE jid = ?
+	`, t.Timestamp.UTC(), preview(t), boolInt(t.FromMe), chatJID)
+	return err
 }
 
 func boolInt(b bool) int {
