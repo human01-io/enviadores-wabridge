@@ -296,6 +296,9 @@ func quotedPreview(qm *waProto.Message) string {
 	filename := ""
 	if media != nil {
 		filename = media.filename
+		if msgType == "location" && media.locationName != "" {
+			return truncateRunes(locationLabel(media.locationName), quotedPreviewMax)
+		}
 	}
 	return truncateRunes(quoteLabel(msgType, body, filename), quotedPreviewMax)
 }
@@ -403,6 +406,8 @@ func attachQuote(msg *waProto.Message, ci *waProto.ContextInfo) *waProto.Message
 		msg.AudioMessage.ContextInfo = ci
 	case msg.DocumentMessage != nil:
 		msg.DocumentMessage.ContextInfo = ci
+	case msg.LocationMessage != nil:
+		msg.LocationMessage.ContextInfo = ci
 	case msg.DocumentWithCaptionMessage.GetMessage().GetDocumentMessage() != nil:
 		msg.DocumentWithCaptionMessage.GetMessage().GetDocumentMessage().ContextInfo = ci
 	}

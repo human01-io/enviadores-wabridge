@@ -418,6 +418,7 @@ func TestAttachQuoteMediaKinds(t *testing.T) {
 		"video":    {VideoMessage: &waProto.VideoMessage{}},
 		"audio":    {AudioMessage: &waProto.AudioMessage{}},
 		"document": {DocumentMessage: &waProto.DocumentMessage{}},
+		"location": {LocationMessage: &waProto.LocationMessage{}},
 		"document with caption": {DocumentWithCaptionMessage: &waProto.FutureProofMessage{
 			Message: &waProto.Message{DocumentMessage: &waProto.DocumentMessage{}}}},
 	}

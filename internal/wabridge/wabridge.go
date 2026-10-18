@@ -5,7 +5,9 @@ package wabridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -47,6 +49,10 @@ type Bridge struct {
 	newMessageID func() types.MessageID
 	lidForPN     func(context.Context, types.JID) (types.JID, error)
 	now          func() time.Time
+
+	// uploadThumbnail stores a bubble preview (the uploader's
+	// UploadThumbnail; a field so tests can stub it, nil skips previews).
+	uploadThumbnail func(sha string, jpeg []byte) (string, error)
 
 	// newChat is the pacing and resend guard of processNewChats. Only the
 	// WatchOutbound goroutine touches it.
@@ -91,6 +97,9 @@ func New(ctx context.Context, cfg *config.Config, st *store.Store, up *media.Upl
 	b.sendMessage = client.SendMessage
 	b.newMessageID = client.GenerateMessageID
 	b.lidForPN = client.Store.LIDs.GetLIDForPN
+	if up != nil {
+		b.uploadThumbnail = up.UploadThumbnail
+	}
 	st.SetLogger(func(format string, args ...any) { clientLog.Warnf(format, args...) })
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -435,20 +444,26 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 				senderJID = nullString(s)
 			}
 
+			// History media is never downloaded, but a location's map
+			// preview travels inside the message, so it is kept.
+			locName, locAddress := locationFields(mediaInfo)
 			m := store.Message{
-				ID:              parsed.Info.ID,
-				ChatJID:         chatJIDStr,
-				SenderJID:       senderJID,
-				FromMe:          parsed.Info.IsFromMe,
-				MessageType:     msgType,
-				Body:            nullString(body),
-				MediaMime:       mediaMime,
-				MediaFilename:   mediaName,
-				QuotedMessageID: quote.MessageID,
-				QuotedPreview:   quote.Preview,
-				QuotedSenderJID: quote.SenderJID,
-				Timestamp:       parsed.Info.Timestamp,
-				Status:          sql.NullString{String: defaultStatus(parsed.Info.IsFromMe), Valid: true},
+				ID:                parsed.Info.ID,
+				ChatJID:           chatJIDStr,
+				SenderJID:         senderJID,
+				FromMe:            parsed.Info.IsFromMe,
+				MessageType:       msgType,
+				Body:              nullString(body),
+				MediaMime:         mediaMime,
+				MediaFilename:     mediaName,
+				MediaThumbnailURL: b.uploadLocationPreview(parsed.Info.ID, mediaInfo),
+				QuotedMessageID:   quote.MessageID,
+				QuotedPreview:     quote.Preview,
+				QuotedSenderJID:   quote.SenderJID,
+				LocationName:      locName,
+				LocationAddress:   locAddress,
+				Timestamp:         parsed.Info.Timestamp,
+				Status:            sql.NullString{String: defaultStatus(parsed.Info.IsFromMe), Valid: true},
 			}
 			if err := b.store.InsertMessage(ctx, m); err != nil {
 				// transient row error — keep going on the next message
@@ -552,7 +567,9 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 		mediaSHA256   sql.NullString
 		mediaThumbURL sql.NullString
 	)
-	if mediaInfo != nil {
+	if mediaInfo != nil && mediaInfo.downloadable == nil {
+		mediaThumbURL = b.uploadLocationPreview(evt.Info.ID, mediaInfo)
+	} else if mediaInfo != nil {
 		data, err := b.client.Download(ctx, mediaInfo.downloadable)
 		if err != nil {
 			b.logger.Warnf("Download media for %s: %v", evt.Info.ID, err)
@@ -572,7 +589,7 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 				// for PDFs and lets long-tail formats (HEIC, video
 				// frame 0) show a preview without per-format decoders.
 				if thumb, terr := b.deriveInboundThumbnail(ctx, msgType, mediaInfo, data); terr == nil && len(thumb) > 0 {
-					if turl, uerr := b.uploader.UploadThumbnail(sha, thumb); uerr == nil {
+					if turl, uerr := b.uploadThumbnail(sha, thumb); uerr == nil {
 						mediaThumbURL = nullString(turl)
 					} else {
 						b.logger.Warnf("SFTP upload thumb for %s: %v", evt.Info.ID, uerr)
@@ -600,6 +617,7 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 		return
 	}
 
+	locName, locAddress := locationFields(mediaInfo)
 	msg := store.Message{
 		ID:                evt.Info.ID,
 		ChatJID:           chatJID,
@@ -616,6 +634,8 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 		QuotedMessageID:   quote.MessageID,
 		QuotedPreview:     quote.Preview,
 		QuotedSenderJID:   quote.SenderJID,
+		LocationName:      locName,
+		LocationAddress:   locAddress,
 		Timestamp:         timestamp,
 		Status:            sql.NullString{String: defaultStatus(fromMe), Valid: true},
 	}
@@ -731,8 +751,8 @@ func tailPreview(t store.TailRow) string {
 		return "Mensaje eliminado"
 	}
 	var m *mediaDescriptor
-	if t.MediaFilename.Valid {
-		m = &mediaDescriptor{filename: t.MediaFilename.String}
+	if t.MediaFilename.Valid || t.LocationName.Valid {
+		m = &mediaDescriptor{filename: t.MediaFilename.String, locationName: t.LocationName.String}
 	}
 	return previewFor(t.MessageType, t.Body.String, m)
 }
@@ -1127,7 +1147,19 @@ func classifyMessage(msg *waProto.Message) (string, string, *mediaDescriptor) {
 		return "sticker", "", &mediaDescriptor{downloadable: m, mime: m.GetMimetype()}
 	case msg.GetLocationMessage() != nil:
 		l := msg.GetLocationMessage()
-		return "location", fmt.Sprintf("%.6f, %.6f", l.GetDegreesLatitude(), l.GetDegreesLongitude()), nil
+		return "location", coordinates(l.GetDegreesLatitude(), l.GetDegreesLongitude()), &mediaDescriptor{
+			embeddedThumbnail: l.GetJPEGThumbnail(),
+			locationName:      strings.TrimSpace(l.GetName()),
+			locationAddress:   strings.TrimSpace(l.GetAddress()),
+		}
+	case msg.GetLiveLocationMessage() != nil:
+		// A live location is stored as a plain location at the position it
+		// was shared from (no place name); later position updates are not
+		// tracked.
+		l := msg.GetLiveLocationMessage()
+		return "location", coordinates(l.GetDegreesLatitude(), l.GetDegreesLongitude()), &mediaDescriptor{
+			embeddedThumbnail: l.GetJPEGThumbnail(),
+		}
 	case msg.GetContactMessage() != nil:
 		return "contact", msg.GetContactMessage().GetDisplayName(), nil
 	case msg.GetReactionMessage() != nil:
@@ -1278,14 +1310,54 @@ func pollPreview(name string, options []string) string {
 }
 
 type mediaDescriptor struct {
+	// downloadable is nil for a location: there is no file to fetch, only
+	// the embedded map preview.
 	downloadable whatsmeow.DownloadableMessage
 	mime         string
 	filename     string
 	// Sender-embedded inline preview, if the proto carried one. We keep
 	// these as the option-1 source for media_thumbnail_url — much cheaper
 	// than rendering our own and works for the long tail of formats
-	// (HEIC, video first frame, doc cover) we can't generate locally.
+	// (HEIC, video first frame, doc cover) we can't generate locally. For a
+	// location it is WhatsApp's rendered map tile.
 	embeddedThumbnail []byte
+	// The place a location points at (empty for a bare pin or a live
+	// location).
+	locationName    string
+	locationAddress string
+}
+
+// coordinates is the body of every location row: "lat, lng" with 6
+// decimals. The web inbox parses the pin back out of it.
+func coordinates(lat, lng float64) string {
+	return fmt.Sprintf("%.6f, %.6f", lat, lng)
+}
+
+// locationFields are the location_name / location_address values of a row,
+// clipped to the column widths.
+func locationFields(m *mediaDescriptor) (name, address sql.NullString) {
+	if m == nil {
+		return
+	}
+	return nullString(truncateRunes(m.locationName, store.LocationNameMax)),
+		nullString(truncateRunes(m.locationAddress, store.LocationAddressMax))
+}
+
+// uploadLocationPreview stores a location's embedded map preview through the
+// thumbnail path and returns its public URL (NULL when there is none or the
+// upload failed). There is no original file, so the preview is keyed by the
+// hash of its own bytes: the same pin shared twice reuses one file.
+func (b *Bridge) uploadLocationPreview(msgID string, m *mediaDescriptor) sql.NullString {
+	if m == nil || m.downloadable != nil || len(m.embeddedThumbnail) == 0 || b.uploadThumbnail == nil {
+		return sql.NullString{}
+	}
+	sum := sha256.Sum256(m.embeddedThumbnail)
+	turl, err := b.uploadThumbnail(hex.EncodeToString(sum[:]), m.embeddedThumbnail)
+	if err != nil {
+		b.logger.Warnf("SFTP upload location preview for %s: %v", msgID, err)
+		return sql.NullString{}
+	}
+	return nullString(turl)
 }
 
 // deriveInboundThumbnail picks the JPEG bytes we'll persist as the
@@ -1321,6 +1393,14 @@ func (b *Bridge) deriveInboundThumbnail(ctx context.Context, msgType string, inf
 }
 
 func previewFor(msgType, body string, m *mediaDescriptor) string {
+	// A location's body is its coordinates: never show those in the list.
+	if msgType == "location" {
+		name := ""
+		if m != nil {
+			name = m.locationName
+		}
+		return locationLabel(name)
+	}
 	if body != "" {
 		return truncate(body, 160)
 	}
@@ -1338,8 +1418,6 @@ func previewFor(msgType, body string, m *mediaDescriptor) string {
 		return "📄 Documento"
 	case "sticker":
 		return "Sticker"
-	case "location":
-		return "📍 Ubicación"
 	case "contact":
 		return "👤 Contacto"
 	case "reaction":
@@ -1348,6 +1426,15 @@ func previewFor(msgType, body string, m *mediaDescriptor) string {
 		return "Mensaje eliminado"
 	}
 	return ""
+}
+
+// locationLabel names a location in the chat list and in quotes: its place
+// name when it has one.
+func locationLabel(name string) string {
+	if name = strings.TrimSpace(name); name != "" {
+		return truncate("📍 "+name, 160)
+	}
+	return "📍 Ubicación"
 }
 
 func defaultStatus(fromMe bool) string {
@@ -1526,7 +1613,7 @@ type outboundRow struct {
 	ClientRequestID string
 	ChatJID         string
 	Body            string
-	Kind            string // "text", "image", "document", "audio", "video"
+	Kind            string // "text", "image", "document", "audio", "video", "reaction", "location"
 	MediaURL        sql.NullString
 	MediaMime       sql.NullString
 	MediaFilename   sql.NullString
@@ -1650,7 +1737,19 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		quote = q
 	}
 
-	msg, msgType, thumbURL, sendErr := b.buildOutboundMessage(ctx, r)
+	var (
+		msg      *waProto.Message
+		msgType  string
+		thumbURL sql.NullString
+		place    *outboundLocation
+		sendErr  error
+	)
+	if r.Kind == "location" {
+		msgType = "location"
+		msg, place, sendErr = b.buildLocationMessage(ctx, r)
+	} else {
+		msg, msgType, thumbURL, sendErr = b.buildOutboundMessage(ctx, r)
+	}
 	if sendErr != nil {
 		// buildOutboundMessage marks permanent failures itself for bad
 		// configuration; re-marking them here would reset attempts and
@@ -1666,7 +1765,7 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		msg = attachQuote(msg, quote.ctxInfo)
 	}
 
-	resp, err := b.client.SendMessage(ctx, chatJID, msg)
+	resp, err := b.sendMessage(ctx, chatJID, msg)
 	if err != nil {
 		b.markOutboundAttempt(ctx, r, err.Error())
 		return
@@ -1714,13 +1813,23 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		msgRow.QuotedPreview = nullString(quote.preview)
 		msgRow.QuotedSenderJID = nullString(quote.senderJID)
 	}
+	if place != nil {
+		// The body the web inbox parses the pin from, in the one format
+		// every location row uses, plus the place it shows on the card.
+		msgRow.Body = nullString(coordinates(place.lat, place.lng))
+		msgRow.LocationName = nullString(place.name)
+		msgRow.LocationAddress = nullString(place.address)
+	}
 	if err := b.store.InsertMessage(ctx, msgRow); err != nil {
 		b.logger.Warnf("Insert outbound wa_messages %s: %v", resp.ID, err)
 	}
 
 	// Reflect on chat tail so the chat list re-sorts.
 	preview := r.Body
-	if preview == "" {
+	if place != nil {
+		// Never the coordinates: "📍 <place>".
+		preview = locationLabel(place.name)
+	} else if preview == "" {
 		preview = previewForKind(msgType, r.MediaFilename.String)
 	}
 	chatRow := store.Chat{
@@ -1845,13 +1954,16 @@ func (b *Bridge) sendReactionRow(ctx context.Context, r outboundRow, chatJID typ
 
 // ownPN / ownLID are our own account JIDs without the device suffix.
 func (b *Bridge) ownPN() types.JID {
-	if b.client.Store.ID == nil {
+	if b.client == nil || b.client.Store.ID == nil {
 		return types.EmptyJID
 	}
 	return b.client.Store.ID.ToNonAD()
 }
 
 func (b *Bridge) ownLID() types.JID {
+	if b.client == nil {
+		return types.EmptyJID
+	}
 	return b.client.Store.GetLID().ToNonAD()
 }
 

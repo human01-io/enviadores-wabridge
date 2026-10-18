@@ -56,8 +56,8 @@ func locatedIn(chat string, exists, fromMe bool) testdb.Handler {
 		}
 		if c.IsQuery && strings.Contains(c.Query, "ORDER BY timestamp DESC, id DESC") {
 			return testdb.Result{
-				Cols: []string{"message_type", "body", "media_filename", "revoked", "from_me", "timestamp"},
-				Rows: [][]driver.Value{{"image", nil, nil, int64(0), int64(0), time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)}},
+				Cols: []string{"message_type", "body", "media_filename", "revoked", "from_me", "timestamp", "location_name"},
+				Rows: [][]driver.Value{{"image", nil, nil, int64(0), int64(0), time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC), nil}},
 			}
 		}
 		return testdb.Result{}
