@@ -68,10 +68,17 @@ func (s *Store) FeatureOff(feature string) bool {
 //
 // The migration is applied before a release ships, so this is only a safety
 // net for a bridge that is started against an older schema.
+//
+// When the error names a column that columnFeature assigns to a different
+// feature, it is returned untouched: a nested Fallback for that feature (see
+// InsertMessage) switches the right one off.
 func (s *Store) Fallback(feature string, newFn, oldFn func() error) error {
 	if !s.FeatureOff(feature) {
 		err := newFn()
 		if err == nil || !IsUnknownColumn(err) {
+			return err
+		}
+		if owner, ok := columnFeature[unknownColumnName(err)]; ok && owner != feature {
 			return err
 		}
 		s.mu.Lock()
@@ -89,6 +96,40 @@ func (s *Store) Fallback(feature string, newFn, oldFn func() error) error {
 		return nil
 	}
 	return oldFn()
+}
+
+// columnFeature names the Fallback feature that owns a column of a newer
+// migration, for features whose statements nest inside another feature's
+// Fallback. An unknown-column error naming one of these columns only switches
+// its own feature off; any other column (or an error whose column cannot be
+// read) is taken to belong to the feature whose Fallback sees it first.
+var columnFeature = map[string]string{
+	"location_name":    featureLocation,
+	"location_address": featureLocation,
+}
+
+// unknownColumnName reads the column out of MySQL's "Unknown column 'x' in
+// 'field list'" message (a qualified 'm.x' gives "x"). Empty when the message
+// has another shape.
+func unknownColumnName(err error) string {
+	var me *mysql.MySQLError
+	if !errors.As(err, &me) {
+		return ""
+	}
+	msg := me.Message
+	i := strings.IndexByte(msg, '\'')
+	if i < 0 {
+		return ""
+	}
+	j := strings.IndexByte(msg[i+1:], '\'')
+	if j < 0 {
+		return ""
+	}
+	col := msg[i+1 : i+1+j]
+	if k := strings.LastIndexByte(col, '.'); k >= 0 {
+		col = col[k+1:]
+	}
+	return col
 }
 
 func Open(ctx context.Context, cfg *config.Config, tunnelAddr string) (*Store, error) {
@@ -340,9 +381,20 @@ type Message struct {
 	QuotedSenderJID   sql.NullString // who wrote the quoted message
 	TargetMessageID   sql.NullString // message_type='reaction': the message reacted to
 	ClientRequestID   sql.NullString // set on outbound sends so the UI can match its optimistic bubble
-	Timestamp         time.Time
-	Status            sql.NullString
+	// LocationName / LocationAddress are the place a message_type='location'
+	// row points at (WhatsApp's LocationMessage.Name / .Address). Both NULL
+	// for a bare pin or a live location; the coordinates stay in Body.
+	LocationName    sql.NullString
+	LocationAddress sql.NullString
+	Timestamp       time.Time
+	Status          sql.NullString
 }
+
+// Widths of wa_messages.location_name / location_address (characters).
+const (
+	LocationNameMax    = 255
+	LocationAddressMax = 500
+)
 
 // featureQuotes names the Fallback feature for the reply / reaction columns
 // of wa_messages (quoted_preview, quoted_sender_jid, target_message_id).
@@ -352,49 +404,75 @@ const featureQuotes = "wa_messages.quotes"
 // revoked_at.
 const featureEdits = "wa_messages.edits"
 
+// featureLocation names the Fallback feature for location_name /
+// location_address.
+const featureLocation = "wa_messages.location"
+
 // featureHeartbeat names the Fallback feature for wa_pairing.last_seen_at.
 const featureHeartbeat = "wa_pairing.last_seen_at"
 
 // InsertMessage writes a single message. INSERT IGNORE so a re-delivered
 // message (same ID) doesn't error. Against a schema without the reply columns
 // it degrades to the legacy column list (quote preview and reaction target
-// are dropped, everything else is stored).
+// are dropped, everything else is stored). A location with a place name or
+// address also writes location_name / location_address; against a schema
+// without them it degrades to the statement without (the pin, its
+// coordinates and its map preview are still stored).
 func (s *Store) InsertMessage(ctx context.Context, m Message) error {
+	if !m.LocationName.Valid && !m.LocationAddress.Valid {
+		return s.insertMessage(ctx, m, false)
+	}
+	return s.Fallback(featureLocation,
+		func() error { return s.insertMessage(ctx, m, true) },
+		func() error { return s.insertMessage(ctx, m, false) })
+}
+
+// insertMessage runs the INSERT with or without the location columns, itself
+// falling back to the legacy reply columns.
+func (s *Store) insertMessage(ctx context.Context, m Message, withLocation bool) error {
+	locCols, locPH := "", ""
+	var locArgs []any
+	if withLocation {
+		locCols, locPH = ", location_name, location_address", ", ?, ?"
+		locArgs = []any{m.LocationName, m.LocationAddress}
+	}
 	return s.Fallback(featureQuotes, func() error {
-		const q = `
+		q := `
 			INSERT IGNORE INTO wa_messages (
 				id, chat_jid, sender_jid, from_me, message_type, body,
 				media_url, media_mime, media_size, media_filename, media_sha256,
 				media_thumbnail_url,
 				quoted_message_id, quoted_preview, quoted_sender_jid, target_message_id,
-				client_request_id, timestamp, status
+				client_request_id, timestamp, status` + locCols + `
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?` + locPH + `)
 		`
-		_, err := s.db.ExecContext(ctx, q,
+		args := append([]any{
 			m.ID, m.ChatJID, m.SenderJID, boolInt(m.FromMe), m.MessageType, m.Body,
 			m.MediaURL, m.MediaMime, m.MediaSize, m.MediaFilename, m.MediaSHA256,
 			m.MediaThumbnailURL,
 			m.QuotedMessageID, m.QuotedPreview, m.QuotedSenderJID, m.TargetMessageID,
 			m.ClientRequestID, m.Timestamp.UTC(), m.Status,
-		)
+		}, locArgs...)
+		_, err := s.db.ExecContext(ctx, q, args...)
 		return err
 	}, func() error {
-		const q = `
+		q := `
 			INSERT IGNORE INTO wa_messages (
 				id, chat_jid, sender_jid, from_me, message_type, body,
 				media_url, media_mime, media_size, media_filename, media_sha256,
 				media_thumbnail_url,
-				quoted_message_id, client_request_id, timestamp, status
+				quoted_message_id, client_request_id, timestamp, status` + locCols + `
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?` + locPH + `)
 		`
-		_, err := s.db.ExecContext(ctx, q,
+		args := append([]any{
 			m.ID, m.ChatJID, m.SenderJID, boolInt(m.FromMe), m.MessageType, m.Body,
 			m.MediaURL, m.MediaMime, m.MediaSize, m.MediaFilename, m.MediaSHA256,
 			m.MediaThumbnailURL,
 			m.QuotedMessageID, m.ClientRequestID, m.Timestamp.UTC(), m.Status,
-		)
+		}, locArgs...)
+		_, err := s.db.ExecContext(ctx, q, args...)
 		return err
 	})
 }
@@ -930,6 +1008,9 @@ type TailRow struct {
 	Revoked       bool
 	FromMe        bool
 	Timestamp     time.Time
+	// LocationName is the place of a location row (NULL for a bare pin, or
+	// when the schema has no location columns yet).
+	LocationName sql.NullString
 }
 
 // RecomputeChatTail refreshes last_message_at / preview / from_me on a chat
@@ -941,25 +1022,35 @@ type TailRow struct {
 // blank). A chat with no countable row is left as it is.
 func (s *Store) RecomputeChatTail(ctx context.Context, chatJID string, preview func(TailRow) string) error {
 	var t TailRow
-	scan := func(q string) func() error {
-		return func() error {
-			var fromMe, revoked int
-			e := s.db.QueryRowContext(ctx, q, chatJID).Scan(
-				&t.MessageType, &t.Body, &t.MediaFilename, &revoked, &fromMe, &t.Timestamp)
-			t.FromMe = fromMe == 1
-			t.Revoked = revoked == 1
-			return e
-		}
-	}
 	const tail = `
 		FROM wa_messages
 		WHERE chat_jid = ?
 		  AND message_type NOT IN ('reaction', 'system')
 		ORDER BY timestamp DESC, id DESC
 		LIMIT 1`
-	err := s.Fallback(featureEdits,
-		scan(`SELECT message_type, body, media_filename, revoked_at IS NOT NULL, from_me, timestamp`+tail),
-		scan(`SELECT message_type, body, media_filename, 0, from_me, timestamp`+tail))
+	// scan selects the tail with or without the edit and location columns
+	// (a literal stands in for a column the schema does not have yet).
+	scan := func(edits, location bool) func() error {
+		revoked, loc := "0", "NULL"
+		if edits {
+			revoked = "revoked_at IS NOT NULL"
+		}
+		if location {
+			loc = "location_name"
+		}
+		q := `SELECT message_type, body, media_filename, ` + revoked + `, from_me, timestamp, ` + loc + tail
+		return func() error {
+			var fromMe, revoked int
+			e := s.db.QueryRowContext(ctx, q, chatJID).Scan(
+				&t.MessageType, &t.Body, &t.MediaFilename, &revoked, &fromMe, &t.Timestamp, &t.LocationName)
+			t.FromMe = fromMe == 1
+			t.Revoked = revoked == 1
+			return e
+		}
+	}
+	err := s.Fallback(featureLocation,
+		func() error { return s.Fallback(featureEdits, scan(true, true), scan(false, true)) },
+		func() error { return s.Fallback(featureEdits, scan(true, false), scan(false, false)) })
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

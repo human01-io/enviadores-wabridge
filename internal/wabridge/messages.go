@@ -296,6 +296,9 @@ func quotedPreview(qm *waProto.Message) string {
 	filename := ""
 	if media != nil {
 		filename = media.filename
+		if msgType == "location" && media.locationName != "" {
+			return truncateRunes(locationLabel(media.locationName), quotedPreviewMax)
+		}
 	}
 	return truncateRunes(quoteLabel(msgType, body, filename), quotedPreviewMax)
 }

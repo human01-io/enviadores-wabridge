@@ -561,9 +561,13 @@ func TestClaimNewChatMessageIDOnlyOnUnclaimedResolveRow(t *testing.T) {
 }
 
 func tailRows(msgType string, body, filename any, revoked int64) testdb.Result {
+	return tailRowsAt(msgType, body, filename, revoked, nil)
+}
+
+func tailRowsAt(msgType string, body, filename any, revoked int64, place any) testdb.Result {
 	return testdb.Result{
-		Cols: []string{"message_type", "body", "media_filename", "revoked", "from_me", "timestamp"},
-		Rows: [][]driver.Value{{msgType, body, filename, revoked, int64(0), t0}},
+		Cols: []string{"message_type", "body", "media_filename", "revoked", "from_me", "timestamp", "location_name"},
+		Rows: [][]driver.Value{{msgType, body, filename, revoked, int64(0), t0, place}},
 	}
 }
 
