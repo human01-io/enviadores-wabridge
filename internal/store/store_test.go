@@ -437,8 +437,19 @@ func TestHeartbeatWritesFeatures(t *testing.T) {
 	if !has(c, "UPDATE wa_pairing SET last_seen_at = UTC_TIMESTAMP(), bridge_features = ?, bridge_features_at = UTC_TIMESTAMP() WHERE id = 1") {
 		t.Fatalf("unexpected heartbeat %s", c.Query)
 	}
-	if len(c.Args) != 1 || c.Args[0] != BridgeFeatures || !strings.Contains(BridgeFeatures, "new_chat") {
+	if len(c.Args) != 1 || c.Args[0] != BridgeFeatures {
 		t.Fatalf("features arg %v", c.Args)
+	}
+	// The web app checks membership in a comma list: exact names, no spaces.
+	got := map[string]bool{}
+	for _, f := range strings.Split(BridgeFeatures, ",") {
+		if f != strings.TrimSpace(f) || f == "" {
+			t.Fatalf("malformed feature list %q", BridgeFeatures)
+		}
+		got[f] = true
+	}
+	if !got["new_chat"] || !got["location_send"] || len(got) != 2 {
+		t.Fatalf("features %q", BridgeFeatures)
 	}
 }
 

@@ -178,11 +178,36 @@ off (one log line) and everything else works as before.
   not paced.
 - **error_code**: every permanent failure writes `wa_outbound.error_code`
   (`NOT_ON_WHATSAPP`, `INVALID_PHONE`, `SEND_FAILED`, `LOOKUP_FAILED`,
-  `EXPIRED`, `UNSUPPORTED_KIND`, `INVALID_JID`, `MEDIA`, `REACTION_TARGET`), and
+  `EXPIRED`, `UNSUPPORTED_KIND`, `INVALID_JID`, `MEDIA`, `REACTION_TARGET`,
+  `INVALID_LOCATION`), and
   `error_message` always starts with `<CODE>: `.
-- **Readiness**: every heartbeat also writes `bridge_features='new_chat'` and
-  `bridge_features_at`. The PHP API queues new chats only while those are
-  fresh, so rolling the bridge back switches the feature off by itself.
+- **Readiness**: every heartbeat also writes `bridge_features` (a comma list,
+  now `new_chat,location_send`) and `bridge_features_at`. The PHP API queues
+  new chats only while those are fresh and list `new_chat`, so rolling the
+  bridge back switches the feature off by itself.
+
+## Branch location (kind='location')
+
+Staff send the office pin from the web inbox ("Ubicación de la sucursal").
+`send-location.php` reads the branch from `pdv_locations` (the bridge has no
+grant on it) and queues an existing-chat `wa_outbound` row: `kind='location'`,
+`body='lat, lng'` (6 decimals), `location_name`, `location_address`,
+`location_url`, optional `quoted_message_id`. It needs the
+`2026_10_17_wa_location_fields` migration and queues only while
+`bridge_features` lists `location_send`; an older bridge fails the row with
+`UNSUPPORTED_KIND`.
+
+- **Send**: a WhatsApp `LocationMessage` (lat/lng, name, address, url) so the
+  customer gets a native pin; with a reply it carries the quote. No map
+  thumbnail is attached: the recipient's app draws the map.
+- **Bad body**: anything but two in-range decimal numbers fails permanently
+  with `INVALID_LOCATION`, without a send or retries.
+- **Stored**: the `wa_messages` row is `message_type='location'`, body in the
+  6-decimal form, `location_name/location_address`, `client_request_id`; the
+  chat preview is `📍 <name>`.
+- **Old schema**: without the `wa_outbound` place columns the pin goes out
+  bare; without the `wa_messages` ones the row is stored without the place.
+  Each logs once and stays off until restart.
 
 **`wabridge check-number +525512345678`** asks WhatsApp whether a phone has
 an account and prints `is_in`, `jid`, `phone_number`, `verified_name` and the

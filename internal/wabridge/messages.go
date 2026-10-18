@@ -406,6 +406,8 @@ func attachQuote(msg *waProto.Message, ci *waProto.ContextInfo) *waProto.Message
 		msg.AudioMessage.ContextInfo = ci
 	case msg.DocumentMessage != nil:
 		msg.DocumentMessage.ContextInfo = ci
+	case msg.LocationMessage != nil:
+		msg.LocationMessage.ContextInfo = ci
 	case msg.DocumentWithCaptionMessage.GetMessage().GetDocumentMessage() != nil:
 		msg.DocumentWithCaptionMessage.GetMessage().GetDocumentMessage().ContextInfo = ci
 	}

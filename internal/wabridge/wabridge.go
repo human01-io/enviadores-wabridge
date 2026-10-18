@@ -1613,7 +1613,7 @@ type outboundRow struct {
 	ClientRequestID string
 	ChatJID         string
 	Body            string
-	Kind            string // "text", "image", "document", "audio", "video"
+	Kind            string // "text", "image", "document", "audio", "video", "reaction", "location"
 	MediaURL        sql.NullString
 	MediaMime       sql.NullString
 	MediaFilename   sql.NullString
@@ -1737,7 +1737,19 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		quote = q
 	}
 
-	msg, msgType, thumbURL, sendErr := b.buildOutboundMessage(ctx, r)
+	var (
+		msg      *waProto.Message
+		msgType  string
+		thumbURL sql.NullString
+		place    *outboundLocation
+		sendErr  error
+	)
+	if r.Kind == "location" {
+		msgType = "location"
+		msg, place, sendErr = b.buildLocationMessage(ctx, r)
+	} else {
+		msg, msgType, thumbURL, sendErr = b.buildOutboundMessage(ctx, r)
+	}
 	if sendErr != nil {
 		// buildOutboundMessage marks permanent failures itself for bad
 		// configuration; re-marking them here would reset attempts and
@@ -1753,7 +1765,7 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		msg = attachQuote(msg, quote.ctxInfo)
 	}
 
-	resp, err := b.client.SendMessage(ctx, chatJID, msg)
+	resp, err := b.sendMessage(ctx, chatJID, msg)
 	if err != nil {
 		b.markOutboundAttempt(ctx, r, err.Error())
 		return
@@ -1801,13 +1813,23 @@ func (b *Bridge) sendOutboundRow(ctx context.Context, r outboundRow) {
 		msgRow.QuotedPreview = nullString(quote.preview)
 		msgRow.QuotedSenderJID = nullString(quote.senderJID)
 	}
+	if place != nil {
+		// The body the web inbox parses the pin from, in the one format
+		// every location row uses, plus the place it shows on the card.
+		msgRow.Body = nullString(coordinates(place.lat, place.lng))
+		msgRow.LocationName = nullString(place.name)
+		msgRow.LocationAddress = nullString(place.address)
+	}
 	if err := b.store.InsertMessage(ctx, msgRow); err != nil {
 		b.logger.Warnf("Insert outbound wa_messages %s: %v", resp.ID, err)
 	}
 
 	// Reflect on chat tail so the chat list re-sorts.
 	preview := r.Body
-	if preview == "" {
+	if place != nil {
+		// Never the coordinates: "📍 <place>".
+		preview = locationLabel(place.name)
+	} else if preview == "" {
 		preview = previewForKind(msgType, r.MediaFilename.String)
 	}
 	chatRow := store.Chat{
@@ -1932,13 +1954,16 @@ func (b *Bridge) sendReactionRow(ctx context.Context, r outboundRow, chatJID typ
 
 // ownPN / ownLID are our own account JIDs without the device suffix.
 func (b *Bridge) ownPN() types.JID {
-	if b.client.Store.ID == nil {
+	if b.client == nil || b.client.Store.ID == nil {
 		return types.EmptyJID
 	}
 	return b.client.Store.ID.ToNonAD()
 }
 
 func (b *Bridge) ownLID() types.JID {
+	if b.client == nil {
+		return types.EmptyJID
+	}
 	return b.client.Store.GetLID().ToNonAD()
 }
 

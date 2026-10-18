@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"testing"
 
 	"github.com/enviadores/wabridge/internal/testdb"
@@ -157,11 +158,74 @@ func TestUnknownColumnName(t *testing.T) {
 	for in, want := range map[error]string{
 		badColumn("location_name"):                      "location_name",
 		badColumn("m.location_name"):                    "location_name",
+		badColumn("wa_outbound.location_url"):           "location_url",
 		&mysql.MySQLError{Number: 1054, Message: "odd"}: "",
-		sql.ErrNoRows:                                   "",
+		sql.ErrNoRows: "",
 	} {
 		if got := unknownColumnName(in); got != want {
 			t.Errorf("%v: got %q want %q", in, got, want)
 		}
+	}
+}
+
+func TestColumnOwnerPrefersTheQualifiedName(t *testing.T) {
+	for col, want := range map[string]string{
+		"location_name":                featureLocation,
+		"m.location_name":              featureLocation,
+		"wa_outbound.location_name":    featureOutboundLocation,
+		"wa_outbound.location_address": featureOutboundLocation,
+		"wa_outbound.location_url":     featureOutboundLocation,
+		"quoted_preview":               "",
+	} {
+		got, ok := columnOwner(badColumn(col))
+		if got != want || ok != (want != "") {
+			t.Errorf("%s: got %q %v want %q", col, got, ok, want)
+		}
+	}
+}
+
+func TestOutboundLocationReadsThePlace(t *testing.T) {
+	st, db, _ := newStore(func(c testdb.Call) testdb.Result {
+		return testdb.Result{
+			Cols: []string{"location_name", "location_address", "location_url"},
+			Rows: [][]driver.Value{{"Sucursal", "Av Cuauhtemoc 53", nil}},
+		}
+	})
+	p, err := st.OutboundLocation(t.Context(), 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Name.String != "Sucursal" || p.Address.String != "Av Cuauhtemoc 53" || p.URL.Valid {
+		t.Fatalf("place %+v", p)
+	}
+	c := db.Calls()
+	if len(c) != 1 || !has(c[0], "SELECT wa_outbound.location_name, wa_outbound.location_address, wa_outbound.location_url", "WHERE id = ?") || c[0].Args[0] != int64(9) {
+		t.Fatalf("query %+v", c)
+	}
+}
+
+func TestOutboundLocationWithoutColumnsIsAnEmptyPlaceOnce(t *testing.T) {
+	st, db, logs := newStore(func(c testdb.Call) testdb.Result {
+		return testdb.Result{Err: badColumn("wa_outbound.location_name")}
+	})
+	for i := 0; i < 2; i++ {
+		p, err := st.OutboundLocation(t.Context(), 9)
+		if err != nil || p.Name.Valid || p.Address.Valid || p.URL.Valid {
+			t.Fatalf("got %+v %v", p, err)
+		}
+	}
+	if len(db.Calls()) != 1 || len(*logs) != 1 {
+		t.Fatalf("one query and one log line expected: %+v %v", db.Calls(), *logs)
+	}
+	if !st.FeatureOff(featureOutboundLocation) || st.FeatureOff(featureLocation) {
+		t.Fatal("only the wa_outbound place feature may switch off")
+	}
+	assertASCII(t, *logs)
+}
+
+func TestOutboundLocationOtherErrorsAreReturned(t *testing.T) {
+	st, _, _ := newStore(func(c testdb.Call) testdb.Result { return testdb.Result{Err: sql.ErrConnDone} })
+	if _, err := st.OutboundLocation(t.Context(), 9); err == nil || st.FeatureOff(featureOutboundLocation) {
+		t.Fatalf("a transient error must reach the caller: %v", err)
 	}
 }

@@ -78,7 +78,7 @@ func (s *Store) Fallback(feature string, newFn, oldFn func() error) error {
 		if err == nil || !IsUnknownColumn(err) {
 			return err
 		}
-		if owner, ok := columnFeature[unknownColumnName(err)]; ok && owner != feature {
+		if owner, ok := columnOwner(err); ok && owner != feature {
 			return err
 		}
 		s.mu.Lock()
@@ -103,15 +103,47 @@ func (s *Store) Fallback(feature string, newFn, oldFn func() error) error {
 // Fallback. An unknown-column error naming one of these columns only switches
 // its own feature off; any other column (or an error whose column cannot be
 // read) is taken to belong to the feature whose Fallback sees it first.
+//
+// wa_outbound has columns of the same names; its statements name them
+// table-qualified ("wa_outbound.location_name"), which MySQL repeats in the
+// error, so they map to their own feature.
 var columnFeature = map[string]string{
-	"location_name":    featureLocation,
-	"location_address": featureLocation,
+	"location_name":                featureLocation,
+	"location_address":             featureLocation,
+	"wa_outbound.location_name":    featureOutboundLocation,
+	"wa_outbound.location_address": featureOutboundLocation,
+	"wa_outbound.location_url":     featureOutboundLocation,
+}
+
+// columnOwner is the columnFeature entry of the column an unknown-column
+// error names: the qualified name as written first, then the bare column.
+func columnOwner(err error) (string, bool) {
+	ref := unknownColumnRef(err)
+	if owner, ok := columnFeature[ref]; ok {
+		return owner, true
+	}
+	col := unknownColumnName(err)
+	if col == ref {
+		return "", false
+	}
+	owner, ok := columnFeature[col]
+	return owner, ok
 }
 
 // unknownColumnName reads the column out of MySQL's "Unknown column 'x' in
 // 'field list'" message (a qualified 'm.x' gives "x"). Empty when the message
 // has another shape.
 func unknownColumnName(err error) string {
+	col := unknownColumnRef(err)
+	if k := strings.LastIndexByte(col, '.'); k >= 0 {
+		col = col[k+1:]
+	}
+	return col
+}
+
+// unknownColumnRef is the column of an unknown-column error as the statement
+// wrote it, qualifier included ("m.x" stays "m.x").
+func unknownColumnRef(err error) string {
 	var me *mysql.MySQLError
 	if !errors.As(err, &me) {
 		return ""
@@ -125,11 +157,7 @@ func unknownColumnName(err error) string {
 	if j < 0 {
 		return ""
 	}
-	col := msg[i+1 : i+1+j]
-	if k := strings.LastIndexByte(col, '.'); k >= 0 {
-		col = col[k+1:]
-	}
-	return col
+	return msg[i+1 : i+1+j]
 }
 
 func Open(ctx context.Context, cfg *config.Config, tunnelAddr string) (*Store, error) {
@@ -407,6 +435,10 @@ const featureEdits = "wa_messages.edits"
 // featureLocation names the Fallback feature for location_name /
 // location_address.
 const featureLocation = "wa_messages.location"
+
+// featureOutboundLocation names the Fallback feature for wa_outbound's
+// location_name / location_address / location_url.
+const featureOutboundLocation = "wa_outbound.location"
 
 // featureHeartbeat names the Fallback feature for wa_pairing.last_seen_at.
 const featureHeartbeat = "wa_pairing.last_seen_at"
@@ -811,12 +843,44 @@ func (s *Store) ClearUnreadUpTo(ctx context.Context, chatJID string, readIDs []s
 	return err
 }
 
+// OutboundPlace is what a kind='location' wa_outbound row says about the
+// place besides its coordinates (those are the row's body). The web app
+// fills it from pdv_locations; the bridge has no grant on that table.
+type OutboundPlace struct {
+	Name    sql.NullString
+	Address sql.NullString
+	URL     sql.NullString
+}
+
+// OutboundLocation reads the place of a kind='location' wa_outbound row.
+// Against a schema without the columns it returns an empty place (the pin
+// still goes out, without a name). The columns are named table-qualified so
+// a missing one is told apart from wa_messages' columns of the same name
+// (see columnFeature).
+func (s *Store) OutboundLocation(ctx context.Context, id int64) (OutboundPlace, error) {
+	var p OutboundPlace
+	err := s.Fallback(featureOutboundLocation, func() error {
+		return s.db.QueryRowContext(ctx, `
+			SELECT wa_outbound.location_name, wa_outbound.location_address, wa_outbound.location_url
+			FROM wa_outbound
+			WHERE id = ?`, id).Scan(&p.Name, &p.Address, &p.URL)
+	}, func() error {
+		p = OutboundPlace{}
+		return nil
+	})
+	return p, err
+}
+
 // BridgeFeatures is the comma list the heartbeat writes to
 // wa_pairing.bridge_features. The web app enables a feature only while a
 // bridge that has it is heartbeating, so a rolled-back bridge (which stamps
 // last_seen_at without this column) switches it off within minutes. Later
-// features append to it ("new_chat,foo").
-const BridgeFeatures = "new_chat"
+// features append to it ("new_chat,foo"); the web app checks membership.
+//
+//   - new_chat: status='resolve' rows (a first message by phone number).
+//   - location_send: kind='location' rows (the branch pin, sent as a
+//     WhatsApp LocationMessage).
+const BridgeFeatures = "new_chat,location_send"
 
 // featureBridgeFeatures names the Fallback feature for
 // wa_pairing.bridge_features / bridge_features_at.
